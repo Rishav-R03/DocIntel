@@ -1,0 +1,6 @@
+# cp backend.hcl.example backend.hcl && terraform init -backend-config=backend.hcl
+bucket       = "CHANGE-ME-terraform-state"
+key          = "docintel/dev/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true

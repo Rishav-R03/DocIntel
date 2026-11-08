@@ -1,0 +1,85 @@
+# Local stack: Postgres 16 + moto (S3/SQS emulator) + migrate + api + worker.
+#   docker compose up --build            -> api on http://localhost:8000
+#   docker compose run --rm test         -> full test suite incl. Postgres integration tests
+
+x-app-env: &app-env
+  DOCINTEL_ENV: local
+  DOCINTEL_LOG_LEVEL: DEBUG
+  DOCINTEL_LOG_JSON: "false"
+  DOCINTEL_DB_HOST: postgres
+  DOCINTEL_DB_NAME: docintel
+  DOCINTEL_DB_USER: docintel
+  DOCINTEL_DB_PASSWORD: docintel
+  DOCINTEL_DB_SSL_MODE: disable
+  DOCINTEL_AWS_REGION: us-east-1
+  DOCINTEL_AWS_ENDPOINT_URL: http://moto:5000
+  DOCINTEL_S3_BUCKET: docintel-local
+  DOCINTEL_SQS_JOBS_URL: http://moto:5000/123456789012/docintel-local-jobs
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: docintel
+      POSTGRES_PASSWORD: docintel
+      POSTGRES_DB: docintel
+    # Host port only matters for native dev; containers use the compose network. 5433 by default
+    # so this stack coexists with other local Postgres instances on 5432.
+    ports: ["${DOCINTEL_HOST_PG_PORT:-5433}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docintel -d docintel"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  moto:
+    image: motoserver/moto:5.1.4
+    ports: ["5000:5000"]
+
+  bootstrap:
+    build: { context: ., target: dev }
+    environment: *app-env
+    volumes: [".:/app"]
+    command: ["python", "scripts/bootstrap_local.py"]
+    depends_on: [moto]
+
+  migrate:
+    build: { context: ., target: runtime }
+    environment: *app-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    build: { context: ., target: runtime, args: { GIT_SHA: local } }
+    environment: *app-env
+    ports: ["8000:8000"]
+    read_only: true
+    tmpfs: [/tmp]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      bootstrap: { condition: service_completed_successfully }
+
+  worker:
+    build: { context: ., target: runtime, args: { GIT_SHA: local } }
+    environment: *app-env
+    command: ["python", "-m", "docintel.worker"]
+    read_only: true
+    tmpfs: [/tmp]
+    depends_on:
+      bootstrap: { condition: service_completed_successfully }
+
+  test:
+    profiles: [test]
+    build: { context: ., target: dev }
+    environment:
+      DOCINTEL_TEST_DB_HOST: postgres
+      DOCINTEL_TEST_AWS_ENDPOINT: http://moto:5000
+      REQUIRE_INTEGRATION: "1"
+    volumes: [".:/app"]
+    command: ["pytest", "--cov", "--cov-report=term-missing"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      moto: { condition: service_started }

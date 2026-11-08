@@ -1,0 +1,65 @@
+name: Deploy
+
+# Runs only after CI succeeds on main, against the exact commit CI tested.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # GitHub OIDC -> AWS STS; no stored AWS keys
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false # never interrupt a half-finished deploy
+
+jobs:
+  deploy-dev:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: dev # protection rules + environment-scoped vars; also pins the OIDC `sub` claim
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      GIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_SHA }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push image
+        env:
+          IMAGE: ${{ vars.ECR_REPOSITORY_URL }}:${{ env.GIT_SHA }}
+        run: |
+          docker build --target runtime --build-arg GIT_SHA="$GIT_SHA" -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Migrate, then roll out api + worker
+        env:
+          IMAGE: ${{ vars.ECR_REPOSITORY_URL }}:${{ env.GIT_SHA }}
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          API_SERVICE: ${{ vars.API_SERVICE }}
+          WORKER_SERVICE: ${{ vars.WORKER_SERVICE }}
+          API_TASK_FAMILY: ${{ vars.API_TASK_FAMILY }}
+          WORKER_TASK_FAMILY: ${{ vars.WORKER_TASK_FAMILY }}
+          SUBNETS: ${{ vars.PRIVATE_SUBNET_IDS }}
+          SECURITY_GROUP: ${{ vars.API_SECURITY_GROUP_ID }}
+        run: scripts/deploy_ecs.sh
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS "${{ vars.API_BASE_URL }}/health/ready"; then exit 0; fi
+            sleep 6
+          done
+          echo "::error::health check did not pass after deploy"; exit 1

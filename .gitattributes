@@ -1,0 +1,6 @@
+# Force LF in the repo and working tree regardless of a developer's core.autocrlf: shell scripts,
+# Dockerfiles and Terraform are executed/parsed inside Linux containers and CI.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary
