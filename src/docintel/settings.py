@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     max_image_pixels: int = Field(default=50_000_000, gt=0)  # A4 @ 600 dpi is ~35 MP
     upload_spool_bytes: int = Field(default=1024 * 1024, gt=0)  # beyond this, spool to /tmp
 
+    # ---- extraction (Gemini). The PRD named gemini-2.5-flash; it is closed to new projects and
+    # retired on Vertex AI as of 2026-10, so the default is its GA successor (journal, Phase 3).
+    gemini_api_key: SecretStr | None = None  # required outside `local`
+    gemini_model: str = "gemini-3.8-flash"
+    gemini_timeout_s: float = Field(default=25.0, gt=0)
+    gemini_inline_max_bytes: int = Field(default=14 * 1024 * 1024, gt=0)  # base64 adds ~33 %
+    retry_max_attempts_sync: int = Field(default=3, ge=1, le=10)
+    sync_deadline_s: float = Field(default=30.0, gt=0)
+    sync_max_concurrency: int = Field(default=32, ge=1)
+    confidence_threshold: float = Field(default=0.7, ge=0, le=1)
+
     # ---- health
     health_check_timeout_s: float = Field(default=1.0, gt=0)
 
@@ -68,6 +79,8 @@ class Settings(BaseSettings):
             raise ValueError("DOCINTEL_AWS_ENDPOINT_URL is only allowed when DOCINTEL_ENV=local")
         if not self.s3_kms_key_id:
             raise ValueError("DOCINTEL_S3_KMS_KEY_ID is required when DOCINTEL_ENV is not local")
+        if self.gemini_api_key is None:
+            raise ValueError("DOCINTEL_GEMINI_API_KEY is required when DOCINTEL_ENV is not local")
         return self
 
 

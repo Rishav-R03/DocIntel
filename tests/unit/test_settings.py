@@ -27,7 +27,14 @@ def test_cloud_envs_reject_endpoint_override(env: str) -> None:
 def test_cloud_envs_require_kms_key() -> None:
     with pytest.raises(ValidationError, match="S3_KMS_KEY_ID"):
         make_settings(env="dev", db_ssl_mode="verify-full")
-    make_settings(env="dev", db_ssl_mode="verify-full", s3_kms_key_id="arn:aws:kms:x")
+    make_settings(
+        env="dev", db_ssl_mode="verify-full", s3_kms_key_id="arn:aws:kms:x", gemini_api_key="k"
+    )
+
+
+def test_cloud_envs_require_gemini_key() -> None:
+    with pytest.raises(ValidationError, match="GEMINI_API_KEY"):
+        make_settings(env="prod", db_ssl_mode="verify-full", s3_kms_key_id="arn:aws:kms:x")
 
 
 def test_secrets_are_masked_in_repr() -> None:

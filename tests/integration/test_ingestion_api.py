@@ -4,76 +4,21 @@ import hashlib
 import json
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
-from typing import Any
 
-import boto3
 import pytest
 from fastapi.testclient import TestClient
 
 from docintel.api.main import create_app
 from docintel.settings import Settings
-from tests.conftest import make_settings
 from tests.helpers import make_image, make_pdf
-from tests.integration.conftest import fetch
+from tests.integration.conftest import Aws, app_settings, fetch
 
 pytestmark = pytest.mark.integration
 
 
-@dataclass
-class Aws:
-    endpoint: str
-    s3: Any
-    sqs: Any
-    bucket: str
-    queue_url: str
-    kms_key_id: str
-
-    def objects(self) -> list[str]:
-        return [o["Key"] for o in self.s3.list_objects_v2(Bucket=self.bucket).get("Contents", [])]
-
-    def messages(self) -> list[dict[str, Any]]:
-        response = self.sqs.receive_message(
-            QueueUrl=self.queue_url, MaxNumberOfMessages=10, MessageAttributeNames=["All"]
-        )
-        return list(response.get("Messages", []))
-
-
-@pytest.fixture
-def aws(moto_endpoint: str) -> Aws:
-    kwargs = {"endpoint_url": moto_endpoint, "region_name": "us-east-1"}
-    s3, sqs, kms = (boto3.client(svc, **kwargs) for svc in ("s3", "sqs", "kms"))
-    suffix = uuid.uuid4().hex[:8]
-    bucket = f"docintel-test-{suffix}"
-    s3.create_bucket(Bucket=bucket)
-    return Aws(
-        endpoint=moto_endpoint,
-        s3=s3,
-        sqs=sqs,
-        bucket=bucket,
-        queue_url=sqs.create_queue(QueueName=f"jobs-{suffix}")["QueueUrl"],
-        kms_key_id=kms.create_key()["KeyMetadata"]["KeyId"],
-    )
-
-
-def _settings(db: Settings, aws: Aws, **overrides: Any) -> Settings:
-    values: dict[str, Any] = {
-        "db_host": db.db_host,
-        "db_name": db.db_name,
-        "db_user": db.db_user,
-        "db_password": db.db_password.get_secret_value(),
-        "aws_endpoint_url": aws.endpoint,
-        "s3_bucket": aws.bucket,
-        "s3_kms_key_id": aws.kms_key_id,
-        "sqs_jobs_url": aws.queue_url,
-        "max_pages": 50,
-    }
-    return make_settings(**{**values, **overrides})
-
-
 @pytest.fixture
 def client(db_settings: Settings, aws: Aws) -> Iterator[TestClient]:
-    with TestClient(create_app(_settings(db_settings, aws))) as c:
+    with TestClient(create_app(app_settings(db_settings, aws))) as c:
         yield c
 
 
@@ -207,7 +152,7 @@ def test_unknown_form_field_rejected(client: TestClient) -> None:
 
 
 def test_queue_failure_marks_job_failed(db_settings: Settings, aws: Aws) -> None:
-    settings = _settings(db_settings, aws, sqs_jobs_url=f"{aws.endpoint}/123456789012/missing")
+    settings = app_settings(db_settings, aws, sqs_jobs_url=f"{aws.endpoint}/123456789012/missing")
     with TestClient(create_app(settings)) as client:
         response = _submit(client, make_pdf(1), headers={"X-Request-Id": "req-queue-down"})
     assert response.status_code == 503
@@ -227,7 +172,7 @@ def test_queue_failure_marks_job_failed(db_settings: Settings, aws: Aws) -> None
 def test_database_down_returns_503_and_removes_staged_object(
     db_settings: Settings, aws: Aws
 ) -> None:
-    settings = _settings(db_settings, aws, db_port=1, db_connect_timeout_s=1)
+    settings = app_settings(db_settings, aws, db_port=1, db_connect_timeout_s=1)
     with TestClient(create_app(settings)) as client:
         response = _submit(client, make_pdf(1))
     assert response.status_code == 503
@@ -237,7 +182,7 @@ def test_database_down_returns_503_and_removes_staged_object(
 
 
 def test_storage_down_returns_503_and_persists_nothing(db_settings: Settings, aws: Aws) -> None:
-    settings = _settings(db_settings, aws, s3_bucket="bucket-that-does-not-exist")
+    settings = app_settings(db_settings, aws, s3_bucket="bucket-that-does-not-exist")
     with TestClient(create_app(settings)) as client:
         response = _submit(client, make_pdf(1), headers={"X-Request-Id": "req-s3-down"})
     assert response.status_code == 503

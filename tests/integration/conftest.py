@@ -5,10 +5,12 @@ import asyncio
 import os
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import asyncpg
+import boto3
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -102,3 +104,55 @@ def fetch(settings: Settings, sql: str, *args: Any) -> list[asyncpg.Record]:
             await conn.close()
 
     return asyncio.run(go())
+
+
+# ----------------------------------------------------------------------------- AWS (moto)
+@dataclass
+class Aws:
+    endpoint: str
+    s3: Any
+    sqs: Any
+    bucket: str
+    queue_url: str
+    kms_key_id: str
+
+    def objects(self) -> list[str]:
+        return [o["Key"] for o in self.s3.list_objects_v2(Bucket=self.bucket).get("Contents", [])]
+
+    def messages(self) -> list[dict[str, Any]]:
+        response = self.sqs.receive_message(
+            QueueUrl=self.queue_url, MaxNumberOfMessages=10, MessageAttributeNames=["All"]
+        )
+        return list(response.get("Messages", []))
+
+
+@pytest.fixture
+def aws(moto_endpoint: str) -> Aws:
+    kwargs = {"endpoint_url": moto_endpoint, "region_name": "us-east-1"}
+    s3, sqs, kms = (boto3.client(svc, **kwargs) for svc in ("s3", "sqs", "kms"))
+    suffix = uuid.uuid4().hex[:8]
+    bucket = f"docintel-test-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    return Aws(
+        endpoint=moto_endpoint,
+        s3=s3,
+        sqs=sqs,
+        bucket=bucket,
+        queue_url=sqs.create_queue(QueueName=f"jobs-{suffix}")["QueueUrl"],
+        kms_key_id=kms.create_key()["KeyMetadata"]["KeyId"],
+    )
+
+
+def app_settings(db: Settings, aws: Aws, **overrides: Any) -> Settings:
+    values: dict[str, Any] = {
+        "db_host": db.db_host,
+        "db_name": db.db_name,
+        "db_user": db.db_user,
+        "db_password": db.db_password.get_secret_value(),
+        "aws_endpoint_url": aws.endpoint,
+        "s3_bucket": aws.bucket,
+        "s3_kms_key_id": aws.kms_key_id,
+        "sqs_jobs_url": aws.queue_url,
+        "max_pages": 50,
+    }
+    return make_settings(**{**values, **overrides})

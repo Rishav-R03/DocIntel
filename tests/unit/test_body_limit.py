@@ -60,11 +60,3 @@ def test_invalid_content_length_is_400() -> None:
     with client:
         response = client.post("/echo", content=b"x", headers={"content-length": "abc"})
     assert response.status_code == 400
-
-
-def test_sync_mode_is_not_implemented_yet() -> None:
-    client, _ = _client()
-    with client:
-        response = client.post("/api/v1/extract?mode=sync")
-    assert response.status_code == 501
-    assert response.json()["code"] == "NOT_IMPLEMENTED"

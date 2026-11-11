@@ -6,6 +6,7 @@ from datetime import datetime
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
+from docintel.api.errors import problem_responses
 from docintel.api.middleware import CLIENT_ID_HEADER, safe_id
 from docintel.api.resources import Resources
 from docintel.domain.errors import JobNotFoundError
@@ -54,7 +55,7 @@ class JobStatusResponse(BaseModel):
         )
 
 
-@router.get("/{job_id}", responses={404: {"description": "Unknown job"}})
+@router.get("/{job_id}", responses=problem_responses(400, 404, 503))
 async def get_job(job_id: uuid.UUID, request: Request) -> JobStatusResponse:
     resources: Resources = request.app.state.resources
     with database_errors_as_unavailable():

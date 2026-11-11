@@ -10,7 +10,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docintel.domain.job import EventStage, JobStatus, check_transition
-from docintel.persistence.models import Job, JobEvent
+from docintel.persistence.models import ExtractionResult, Job, JobEvent, LlmCallAudit
 
 
 class JobRepository:
@@ -46,6 +46,25 @@ class JobRepository:
             .execution_options(synchronize_session=False)
         )
         return (await self._session.execute(stmt)).scalar_one_or_none()
+
+
+class ResultRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    def add(self, result: ExtractionResult) -> None:
+        self._session.add(result)
+
+    async def get(self, job_id: uuid.UUID) -> ExtractionResult | None:
+        return await self._session.get(ExtractionResult, job_id)
+
+
+class AuditRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    def add_all(self, rows: Sequence[LlmCallAudit]) -> None:
+        self._session.add_all(rows)
 
 
 class EventRepository:

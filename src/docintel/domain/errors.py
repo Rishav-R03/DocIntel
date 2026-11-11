@@ -22,6 +22,13 @@ class ErrorCode(StrEnum):
     PAGE_LIMIT_EXCEEDED = "PAGE_LIMIT_EXCEEDED"
     IMAGE_TOO_LARGE = "IMAGE_TOO_LARGE"
     DOCUMENT_UNREADABLE = "DOCUMENT_UNREADABLE"
+    # extraction
+    EXTRACTION_FAILED = "EXTRACTION_FAILED"
+    SCHEMA_VALIDATION_FAILED = "SCHEMA_VALIDATION_FAILED"
+    OUTPUT_TRUNCATED = "OUTPUT_TRUNCATED"
+    UPSTREAM_UNAVAILABLE = "UPSTREAM_UNAVAILABLE"
+    EXTRACTION_TIMEOUT = "EXTRACTION_TIMEOUT"
+    SYNC_CAPACITY_EXHAUSTED = "SYNC_CAPACITY_EXHAUSTED"
     # jobs / infrastructure
     JOB_NOT_FOUND = "JOB_NOT_FOUND"
     DEPENDENCY_UNAVAILABLE = "DEPENDENCY_UNAVAILABLE"
@@ -109,3 +116,44 @@ class DependencyUnavailableError(DocIntelError):
     status_code = HTTPStatus.SERVICE_UNAVAILABLE
     title = "Dependency unavailable"
     headers: ClassVar[dict[str, str] | None] = {"Retry-After": "5"}
+
+
+# ----------------------------------------------------------------------------- extraction
+class ExtractionFailedError(DocIntelError):
+    """The model call failed in a way retrying won't fix (bad request, auth, model error)."""
+
+    code = ErrorCode.EXTRACTION_FAILED
+    status_code = HTTPStatus.BAD_GATEWAY
+    title = "Extraction failed"
+
+
+class SchemaValidationFailedError(DocIntelError):
+    code = ErrorCode.SCHEMA_VALIDATION_FAILED
+    status_code = HTTPStatus.BAD_GATEWAY
+    title = "Model output did not match the schema"
+
+
+class OutputTruncatedError(DocIntelError):
+    code = ErrorCode.OUTPUT_TRUNCATED
+    status_code = HTTPStatus.BAD_GATEWAY
+    title = "Model output was truncated"
+
+
+class UpstreamUnavailableError(DocIntelError):
+    code = ErrorCode.UPSTREAM_UNAVAILABLE
+    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+    title = "AI provider unavailable"
+    headers: ClassVar[dict[str, str] | None] = {"Retry-After": "10"}
+
+
+class ExtractionTimeoutError(DocIntelError):
+    code = ErrorCode.EXTRACTION_TIMEOUT
+    status_code = HTTPStatus.GATEWAY_TIMEOUT
+    title = "Extraction timed out"
+
+
+class SyncCapacityExhaustedError(DocIntelError):
+    code = ErrorCode.SYNC_CAPACITY_EXHAUSTED
+    status_code = HTTPStatus.TOO_MANY_REQUESTS
+    title = "Synchronous capacity exhausted"
+    headers: ClassVar[dict[str, str] | None] = {"Retry-After": "2"}

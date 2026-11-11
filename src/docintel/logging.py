@@ -13,6 +13,13 @@ from structlog.types import EventDict, Processor, WrappedLogger
 
 from docintel.settings import Settings
 
+# Structured tracebacks WITHOUT frame locals. structlog's default ``dict_tracebacks`` serialises
+# every frame's local variables, which put the database password (asyncpg connect frames) and
+# whole job/attempt objects into the log stream. Frames (file/line/function) are enough to debug.
+_STRUCTURED_TRACEBACKS = structlog.processors.ExceptionRenderer(
+    structlog.tracebacks.ExceptionDictTransformer(show_locals=False)
+)
+
 _NOISY_LOGGERS = ("botocore", "aiobotocore", "boto3", "urllib3", "asyncio")
 
 
@@ -36,9 +43,9 @@ def configure_logging(settings: Settings) -> None:
         _static_fields(settings),
     ]
     renderer: list[Processor] = (
-        [structlog.processors.dict_tracebacks, structlog.processors.JSONRenderer()]
+        [_STRUCTURED_TRACEBACKS, structlog.processors.JSONRenderer()]
         if settings.log_json
-        else [structlog.dev.ConsoleRenderer()]
+        else [structlog.dev.ConsoleRenderer(exception_formatter=structlog.dev.plain_traceback)]
     )
 
     structlog.configure(

@@ -6,6 +6,7 @@ from typing import Any, cast
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -100,6 +101,49 @@ async def _http_error(request: Request, exc: Exception) -> JSONResponse:
     if http_exc.headers:
         response.headers.update(http_exc.headers)
     return response
+
+
+def problem_responses(*statuses: int) -> dict[int | str, dict[str, Any]]:
+    """OpenAPI ``responses`` entries for error statuses, all rendered as problem+json."""
+    return {s: {"model": Problem, "description": HTTPStatus(s).phrase} for s in statuses}
+
+
+def install_problem_openapi(app: FastAPI) -> None:
+    """Make the published contract match runtime behaviour.
+
+    FastAPI documents request-validation failures as ``422 HTTPValidationError`` with
+    ``application/json``; this service returns ``400`` problem+json instead. Rewrite the generated
+    schema so every error response points at ``Problem`` under ``application/problem+json``.
+    """
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = get_openapi(
+            title=app.title, version=app.version, description=app.description, routes=app.routes
+        )
+        problem_ref = {"$ref": "#/components/schemas/Problem"}
+        for operations in schema.get("paths", {}).values():
+            for operation in operations.values():
+                responses = operation.get("responses", {})
+                auto_422 = responses.get("422", {}).get("content", {}).get("application/json", {})
+                if auto_422.get("schema", {}).get("$ref", "").endswith("/HTTPValidationError"):
+                    del responses["422"]
+                    responses.setdefault("400", {"description": "Bad Request"})
+                for status, spec in responses.items():
+                    if int(status) >= 400:
+                        spec["content"] = {PROBLEM_MEDIA_TYPE: {"schema": problem_ref}}
+        components = schema.setdefault("components", {}).setdefault("schemas", {})
+        components.pop("HTTPValidationError", None)
+        components.pop("ValidationError", None)
+        if "Problem" not in components:  # FastAPI adds it (and ErrorCode) via problem_responses
+            components["Problem"] = Problem.model_json_schema(
+                ref_template="#/components/schemas/{model}"
+            )
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def register_exception_handlers(app: FastAPI) -> None:

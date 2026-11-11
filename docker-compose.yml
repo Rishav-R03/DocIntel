@@ -55,6 +55,7 @@ services:
   api:
     build: { context: ., target: runtime, args: { GIT_SHA: local } }
     environment: *app-env
+    env_file: [{ path: .env, required: false }]  # DOCINTEL_GEMINI_API_KEY lives here (git-ignored)
     ports: ["8000:8000"]
     read_only: true
     tmpfs: [/tmp]
@@ -74,6 +75,7 @@ services:
   test:
     profiles: [test]
     build: { context: ., target: dev }
+    env_file: [{ path: .env, required: false }]
     environment:
       DOCINTEL_TEST_DB_HOST: postgres
       DOCINTEL_TEST_AWS_ENDPOINT: http://moto:5000

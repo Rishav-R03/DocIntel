@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 
-from docintel.api.errors import register_exception_handlers
+from docintel.api.errors import install_problem_openapi, register_exception_handlers
 from docintel.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
 from docintel.api.resources import ResourcesFactory, build_resources
 from docintel.api.routes import extract, health, jobs
@@ -57,4 +57,5 @@ def create_app(
     app.include_router(health.router)
     app.include_router(extract.router)
     app.include_router(jobs.router)
+    install_problem_openapi(app)
     return app
