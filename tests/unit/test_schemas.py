@@ -159,3 +159,37 @@ def test_contract_rules() -> None:
     domain, _ = contract.to_domain(wire)
     assert domain.auto_renews.value == "yes"
     assert sorted(_codes(contract.rules(domain))) == ["TERM_REVERSED", "TOO_FEW_PARTIES"]
+
+
+def test_length_limit_on_array_of_objects_is_rejected() -> None:
+    """Regression: maxItems=50 on generic_document.key_values made Gemini 3.5 Flash-Lite reject the
+    schema with HTTP 400 "too many states for serving"."""
+
+    class Item(BaseModel):
+        name: str
+
+    class Capped(BaseModel):
+        items: list[Item] = Field(max_length=50)
+
+    with pytest.raises(UnsupportedSchemaError, match="length limit on an array of objects"):
+        gemini_json_schema(Capped)
+
+
+def test_generic_document_caps_key_values_in_domain_with_warning() -> None:
+    from docintel.schemas import generic_document as gd
+
+    kv = {"key": cv("k"), "value": cv("v")}
+    wire = gd.GenericDocumentWire.model_validate(
+        {
+            "title": cv("T"),
+            "document_type": cv("memo"),
+            "document_date": cv(None, 0.1, None),
+            "parties": [],
+            "key_values": [kv] * 60,
+            "summary": cv("s"),
+            "document_validity_score": 0.9,
+        }
+    )
+    domain, warnings = gd.to_domain(wire)
+    assert len(domain.key_values) == gd.MAX_KEY_VALUES
+    assert [(w.code, w.field) for w in warnings] == [("TRUNCATED", "key_values")]

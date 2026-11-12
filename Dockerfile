@@ -1,5 +1,7 @@
-# syntax=docker/dockerfile:1.7
 # One image, two entrypoints (ADR-01): api (default CMD) and worker (`python -m docintel.worker`).
+# No `# syntax=` directive on purpose: it makes every build fetch the Dockerfile frontend from Docker
+# Hub, which fails on flaky DNS. Docker's built-in frontend supports everything used here
+# (RUN --mount=type=cache, ADD --chmod).
 
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.8.22

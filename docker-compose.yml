@@ -28,6 +28,7 @@ services:
     # Host port only matters for native dev; containers use the compose network. 5433 by default
     # so this stack coexists with other local Postgres instances on 5432.
     ports: ["${DOCINTEL_HOST_PG_PORT:-5433}:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]  # survives `down`; `down -v` resets
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U docintel -d docintel"]
       interval: 2s
@@ -75,7 +76,7 @@ services:
   test:
     profiles: [test]
     build: { context: ., target: dev }
-    env_file: [{ path: .env, required: false }]
+    image: docintel-dev:local  # fixed name (not folder-derived) so `live` can reuse it
     environment:
       DOCINTEL_TEST_DB_HOST: postgres
       DOCINTEL_TEST_AWS_ENDPOINT: http://moto:5000
@@ -85,3 +86,16 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       moto: { condition: service_started }
+
+  # Opt-in live checks against the real Gemini API (costs money; needs DOCINTEL_GEMINI_API_KEY in
+  # .env). Kept separate from `test` so the test suite never sees real secrets.
+  #   docker compose run --rm live python scripts/live_smoke.py --runs 3
+  live:
+    profiles: [tools]
+    image: docintel-dev:local  # the dev image built by `test`; never rebuild or pull
+    pull_policy: never
+    env_file: [{ path: .env, required: true }]
+    volumes: [".:/app"]
+
+volumes:
+  pgdata:

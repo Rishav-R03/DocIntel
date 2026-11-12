@@ -1,6 +1,7 @@
 """Scripted Gemini stand-in and payload builders for extraction tests."""
 
 import copy
+import dataclasses
 import json
 from typing import Any, cast
 
@@ -57,12 +58,16 @@ class ScriptedGemini:
         item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
-        return item
+        # Like the real client: the response records which model served it.
+        return dataclasses.replace(item, model=kwargs.get("model") or self.model)
 
 
-def pipeline_with(gemini: ScriptedGemini) -> ExtractionPipeline:
+def pipeline_with(gemini: ScriptedGemini, *, fallback: str | None = None) -> ExtractionPipeline:
     return ExtractionPipeline(
-        cast(GeminiClient, gemini), retry_policy=FAST_RETRIES, low_confidence_threshold=0.7
+        cast(GeminiClient, gemini),
+        retry_policy=FAST_RETRIES,
+        fallback_model=fallback,
+        low_confidence_threshold=0.7,
     )
 
 

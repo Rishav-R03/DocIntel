@@ -20,7 +20,19 @@ _STRUCTURED_TRACEBACKS = structlog.processors.ExceptionRenderer(
     structlog.tracebacks.ExceptionDictTransformer(show_locals=False)
 )
 
-_NOISY_LOGGERS = ("botocore", "aiobotocore", "boto3", "urllib3", "asyncio")
+# HTTP client internals log every connect/TLS/header step at DEBUG, burying useful lines.
+_NOISY_LOGGERS = (
+    "botocore",
+    "aiobotocore",
+    "boto3",
+    "urllib3",
+    "asyncio",
+    "httpcore",
+    "httpx",
+    "httpx2",
+    "hpack",
+    "google_genai",
+)
 
 
 def _static_fields(settings: Settings) -> Processor:

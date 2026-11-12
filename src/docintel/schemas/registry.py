@@ -49,6 +49,11 @@ class UnsupportedSchemaError(ValueError):
     pass
 
 
+def _items_are_objects(node: dict[str, Any]) -> bool:
+    items = node.get("items", {})
+    return "$ref" in items or items.get("type") == "object"
+
+
 def _clean(node: Any, path: str) -> Any:
     if isinstance(node, list):
         return [_clean(item, f"{path}[{i}]") for i, item in enumerate(node)]
@@ -61,6 +66,15 @@ def _clean(node: Any, path: str) -> Any:
         if key in ("properties", "$defs"):  # maps of name -> schema: names aren't keywords
             out[key] = {name: _clean(sub, f"{path}.{key}.{name}") for name, sub in value.items()}
             continue
+        if (
+            key in ("minItems", "maxItems")
+            and node.get("type") == "array"
+            and _items_are_objects(node)
+        ):
+            # Each allowed length multiplies the decoding grammar's states for the whole item
+            # subtree; Gemini rejects such schemas ("too many states for serving"). Enforce the
+            # limit in the domain conversion instead.
+            raise UnsupportedSchemaError(f"length limit on an array of objects at {path}")
         if key not in SUPPORTED_KEYWORDS:
             raise UnsupportedSchemaError(f"unsupported JSON Schema keyword {key!r} at {path}")
         if key == "format" and value not in SUPPORTED_FORMATS:
@@ -84,7 +98,6 @@ class SchemaSpec:
     prompt: str
     critical_fields: tuple[str, ...]
     max_pages: int = 50
-    thinking_level: str = "low"  # lowest level gemini-3.8-flash accepts ("minimal" errors)
     max_output_tokens: int = 16_384
 
     @cached_property

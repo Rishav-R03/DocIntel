@@ -160,3 +160,30 @@ def test_connection_errors_are_retryable() -> None:
 
 def test_unknown_errors_are_fatal() -> None:
     assert classify_error(RuntimeError("weird"), 5).retryable is False
+
+
+def test_sdk_level_retries_are_disabled() -> None:
+    """Regression: the SDK's default (5 attempts / 30 s) stacked under our retry policy, hid
+    attempts from the audit log and consumed the sync deadline inside a single attempt."""
+    from google.genai._gaos.google_genai import _translate_retry_config
+
+    from docintel.extraction.gemini_client import create_genai_client
+
+    client = create_genai_client("test-key")
+    http_options = client._api_client._http_options
+    assert http_options.retry_options.attempts == 1
+    assert (
+        _translate_retry_config(http_options).max_retries == 0
+    )  # what the Interactions client uses
+
+
+def test_provider_message_is_captured_for_diagnosis() -> None:
+    err = classify_error(_http_error(429), latency_ms=5)
+    assert err.provider_message == "boom"  # e.g. which quota was exhausted, for the logs
+
+
+async def test_per_call_model_override_is_sent_and_recorded() -> None:
+    aio = FakeAio(_interaction())
+    result = await _generate(_client(aio), model="gemini-3.5-flash-lite")
+    assert aio.created[0]["model"] == "gemini-3.5-flash-lite"
+    assert result.model == "gemini-3.5-flash-lite"

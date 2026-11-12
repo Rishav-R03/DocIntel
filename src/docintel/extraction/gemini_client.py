@@ -8,6 +8,11 @@ tests/unit/test_gemini_client.py.
 Privacy: every request sets ``store=False``. The Interactions API can persist requests and
 responses server-side for later retrieval; for customer financial documents that must be opt-in,
 never a default we inherit.
+
+Retries: the SDK retries internally by default (5 attempts, up to 30 s). Stacked under our own
+deadline-aware policy that multiplied calls to an already-overloaded provider, consumed the whole
+latency budget inside one "attempt", and hid attempts from the audit log. ``create_genai_client``
+disables SDK retries so exactly one layer (extraction/resilience.py) owns them.
 """
 
 import base64
@@ -18,6 +23,7 @@ from typing import Any, Literal
 
 import structlog
 from google import genai
+from google.genai import types
 
 # Private SDK modules: confined to this file on purpose (see module docstring).
 from google.genai._gaos.errors.genaierror import GenAiError
@@ -27,6 +33,14 @@ log = structlog.get_logger(__name__)
 
 InputMode = Literal["INLINE", "FILES_API"]
 _RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def create_genai_client(api_key: str) -> genai.Client:
+    """The only way the service builds an SDK client: SDK-level retries off (see docstring)."""
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1)),
+    )
 
 
 @dataclass(frozen=True)
@@ -46,6 +60,7 @@ class GeminiResponse:
     latency_ms: int
     input_mode: InputMode
     error_messages: tuple[str, ...] = ()
+    model: str = ""  # the model that actually served this call (primary or fallback)
 
 
 class GeminiCallError(Exception):
@@ -60,6 +75,7 @@ class GeminiCallError(Exception):
         error_type: str,
         latency_ms: int,
         retry_after_s: float | None = None,
+        provider_message: str | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
@@ -67,6 +83,9 @@ class GeminiCallError(Exception):
         self.error_type = error_type
         self.latency_ms = latency_ms
         self.retry_after_s = retry_after_s
+        # Gemini's own explanation (e.g. which quota a 429 hit). Truncated; never contains
+        # document content or credentials.
+        self.provider_message = provider_message
 
 
 def _retry_after(headers: Any) -> float | None:
@@ -75,6 +94,11 @@ def _retry_after(headers: Any) -> float | None:
         return float(raw) if raw is not None else None
     except ValueError:
         return None  # HTTP-date form; fall back to our own backoff
+
+
+def _provider_message(exc: BaseException) -> str | None:
+    text = " ".join(str(getattr(exc, "message", None) or exc).split())
+    return text[:300] or None
 
 
 def classify_error(exc: BaseException, latency_ms: int) -> GeminiCallError:
@@ -88,6 +112,7 @@ def classify_error(exc: BaseException, latency_ms: int) -> GeminiCallError:
             http_status=None,
             error_type=type(exc).__name__,
             latency_ms=latency_ms,
+            provider_message=_provider_message(exc),
         )
     if isinstance(exc, GenAiError | compat_errors.APIStatusError) and isinstance(status, int):
         return GeminiCallError(
@@ -97,6 +122,7 @@ def classify_error(exc: BaseException, latency_ms: int) -> GeminiCallError:
             error_type=type(exc).__name__,
             latency_ms=latency_ms,
             retry_after_s=_retry_after(getattr(exc, "headers", None)),
+            provider_message=_provider_message(exc),
         )
     return GeminiCallError(
         str(exc) or type(exc).__name__,
@@ -104,6 +130,7 @@ def classify_error(exc: BaseException, latency_ms: int) -> GeminiCallError:
         http_status=status,
         error_type=type(exc).__name__,
         latency_ms=latency_ms,
+        provider_message=_provider_message(exc),
     )
 
 
@@ -142,10 +169,12 @@ class GeminiClient:
         thinking_level: str,
         max_output_tokens: int,
         timeout_s: float | None = None,
+        model: str | None = None,
     ) -> GeminiResponse:
         """``timeout_s`` (the caller's remaining deadline) can only shorten the configured
         per-call timeout, never extend it."""
         timeout = min(self._timeout_s, timeout_s) if timeout_s else self._timeout_s
+        model = model or self.model
         start = time.perf_counter()
         uploaded_name: str | None = None
         try:
@@ -169,7 +198,7 @@ class GeminiClient:
                     "mime_type": mime_type,
                 }
             interaction = await self._client.aio.interactions.create(
-                model=self.model,
+                model=model,
                 input=[doc_part, {"type": "text", "text": prompt}],
                 system_instruction=system_instruction,
                 response_format={
@@ -201,6 +230,7 @@ class GeminiClient:
             latency_ms=_elapsed_ms(start),
             input_mode=input_mode,
             error_messages=errors,
+            model=model,
         )
 
     async def _delete_quietly(self, name: str) -> None:

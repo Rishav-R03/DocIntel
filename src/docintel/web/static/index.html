@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DocIntel AI · Demo</title>
+  <link rel="stylesheet" href="vendor/bootstrap.min.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body class="bg-body-tertiary">
+  <nav class="navbar navbar-dark bg-dark">
+    <div class="container-xl">
+      <span class="navbar-brand fw-semibold">DocIntel AI <span class="text-secondary fw-normal small">document extraction demo</span></span>
+      <div class="d-flex align-items-center gap-3">
+        <span id="health" class="badge text-bg-secondary">Checking API…</span>
+        <a class="link-light small" href="/docs" target="_blank" rel="noopener">API docs</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container-xl py-4">
+    <div class="row g-4">
+      <!-- ============================================================ input -->
+      <div class="col-lg-5">
+        <form id="upload-form" class="card shadow-sm" novalidate>
+          <div class="card-header fw-semibold">1. Upload a document</div>
+          <div class="card-body vstack gap-3">
+            <label id="dropzone" class="dropzone rounded-3 p-4 text-center" for="file">
+              <span class="d-block fw-semibold">Drop a PDF, PNG or JPEG here</span>
+              <span class="d-block small text-secondary">or click to browse · max 25 MB · max 50 pages</span>
+              <span id="file-name" class="d-block mt-2 small text-primary"></span>
+            </label>
+            <input id="file" name="file" type="file" class="d-none"
+                   accept="application/pdf,image/png,image/jpeg,.pdf,.png,.jpg,.jpeg" required>
+
+            <div>
+              <label class="form-label" for="schema">Document type (schema)</label>
+              <select id="schema" class="form-select" required>
+                <option value="">Loading schemas…</option>
+              </select>
+              <div id="schema-help" class="form-text"></div>
+            </div>
+
+            <div>
+              <span class="form-label d-block">Mode</span>
+              <div class="btn-group w-100" role="group" aria-label="Mode">
+                <input type="radio" class="btn-check" name="mode" id="mode-sync" value="sync" checked>
+                <label class="btn btn-outline-primary" for="mode-sync">Sync · extract now</label>
+                <input type="radio" class="btn-check" name="mode" id="mode-async" value="async">
+                <label class="btn btn-outline-primary" for="mode-async">Async · queue job</label>
+              </div>
+            </div>
+
+            <details>
+              <summary class="small text-secondary">Advanced</summary>
+              <label class="form-label mt-2" for="client-id">X-Client-Id (optional)</label>
+              <input id="client-id" class="form-control form-control-sm" maxlength="128"
+                     placeholder="e.g. acme — jobs are only visible to the same client id">
+            </details>
+
+            <div id="client-error" class="alert alert-warning py-2 small d-none" role="alert"></div>
+
+            <button id="submit" class="btn btn-primary btn-lg" type="submit" disabled>
+              <span id="submit-spinner" class="spinner-border spinner-border-sm me-2 d-none" aria-hidden="true"></span>
+              <span id="submit-label">Extract</span>
+            </button>
+          </div>
+        </form>
+
+        <div id="preview-card" class="card shadow-sm mt-4 d-none">
+          <div class="card-header fw-semibold">Preview</div>
+          <div id="preview" class="card-body p-2 text-center"></div>
+        </div>
+      </div>
+
+      <!-- ============================================================ output -->
+      <div class="col-lg-7">
+        <div class="card shadow-sm">
+          <div class="card-header fw-semibold">2. Result</div>
+          <div id="result" class="card-body">
+            <div class="text-secondary text-center py-5">
+              Choose a document and a schema, then press <strong>Extract</strong>.<br>
+              <span class="small">Sync mode returns validated JSON with per-field confidence, warnings, token usage and cost.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer class="container-xl pb-4 small text-secondary">
+    Demo UI for local development only. The service itself is a headless API · every value shown
+    comes from the model and is rendered as plain text.
+  </footer>
+
+  <script src="vendor/bootstrap.bundle.min.js"></script>
+  <script src="app.js" type="module"></script>
+</body>
+</html>

@@ -25,6 +25,8 @@ PRICES: dict[str, tuple[Price, ...]] = {
         Price(date(2026, 9, 2), Decimal("0.75"), Decimal("3.75")),  # introductory, to 2026-12-31
         Price(date(2027, 1, 1), Decimal("1.50"), Decimal("7.50")),
     ),
+    # Fallback model. No scheduled change listed (checked 2026-11-12).
+    "gemini-3.5-flash-lite": (Price(date(2026, 1, 1), Decimal("0.30"), Decimal("2.50")),),
 }
 
 

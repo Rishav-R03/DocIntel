@@ -34,3 +34,11 @@ def test_exception_logs_never_include_frame_locals(
             if f["name"] == "_connect"
         ]
         assert "locals" not in frame
+
+
+def test_http_client_debug_noise_is_suppressed() -> None:
+    import logging
+
+    configure_logging(make_settings(log_level="DEBUG"))
+    for name in ("httpcore", "httpx", "httpx2", "google_genai"):
+        assert logging.getLogger(name).level == logging.WARNING, name

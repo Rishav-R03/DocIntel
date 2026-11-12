@@ -14,7 +14,7 @@ from google import genai
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docintel.aws import client_kwargs, create_session
-from docintel.extraction.gemini_client import GeminiClient
+from docintel.extraction.gemini_client import GeminiClient, create_genai_client
 from docintel.extraction.pipeline import ExtractionPipeline
 from docintel.extraction.resilience import RetryPolicy
 from docintel.health import DatabaseCheck, HealthCheck, S3BucketCheck
@@ -44,9 +44,19 @@ def build_pipeline(settings: Settings, client: genai.Client) -> ExtractionPipeli
         timeout_s=settings.gemini_timeout_s,
         inline_max_bytes=settings.gemini_inline_max_bytes,
     )
+    fallback = settings.gemini_fallback_model or None  # "" disables failover
+    if fallback == settings.gemini_model:
+        fallback = None
+    # With a fallback available, give the primary fewer tries: during a provider brown-out, failing
+    # over quickly beats burning the sync deadline (and free-tier quota) on an overloaded model.
+    primary_attempts = (
+        settings.gemini_fallback_after_attempts if fallback else settings.retry_max_attempts_sync
+    )
     return ExtractionPipeline(
         gemini,
-        retry_policy=RetryPolicy(max_attempts=settings.retry_max_attempts_sync),
+        retry_policy=RetryPolicy(max_attempts=primary_attempts),
+        fallback_model=fallback,
+        fallback_policy=RetryPolicy(max_attempts=settings.retry_max_attempts_sync),
         low_confidence_threshold=settings.confidence_threshold,
     )
 
@@ -61,7 +71,7 @@ async def build_resources(
     aws = create_session(settings)
     gemini: genai.Client | None = None
     if pipeline is None and settings.gemini_api_key is not None:
-        gemini = genai.Client(api_key=settings.gemini_api_key.get_secret_value())
+        gemini = create_genai_client(settings.gemini_api_key.get_secret_value())
         pipeline = build_pipeline(settings, gemini)
     elif pipeline is None:
         log.warning("gemini_not_configured", detail="mode=sync will return 503")

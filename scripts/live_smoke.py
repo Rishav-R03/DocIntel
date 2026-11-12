@@ -15,10 +15,10 @@ import statistics
 import sys
 import time
 
-from google import genai
 from PIL import Image, ImageDraw, ImageFont
 
 from docintel.api.resources import build_pipeline
+from docintel.extraction.gemini_client import create_genai_client
 from docintel.extraction.pipeline import Attempt
 from docintel.logging import configure_logging
 from docintel.schemas.registry import get_schema
@@ -77,7 +77,7 @@ async def main(runs: int) -> int:
         print("DOCINTEL_GEMINI_API_KEY is not set (add it to .env).", file=sys.stderr)
         return 2
     configure_logging(settings.model_copy(update={"log_level": "WARNING"}))
-    client = genai.Client(api_key=settings.gemini_api_key.get_secret_value())
+    client = create_genai_client(settings.gemini_api_key.get_secret_value())
     pipeline = build_pipeline(settings, client)
     spec, document = get_schema("invoice.v1"), render_invoice()
     print(f"model={settings.gemini_model} schema={spec.schema_id} document={len(document):,} B PNG")
@@ -101,7 +101,7 @@ async def main(runs: int) -> int:
                 f" | validity {outcome.validity.adjusted} (model {outcome.validity.model_reported})"
                 f" | tokens in={outcome.input_tokens} out={outcome.output_tokens}"
                 f" think={outcome.thought_tokens} | ${outcome.cost_usd}"
-                f" | attempts={[a.outcome for a in attempts]}"
+                f" | attempts={[f'{a.model}:{a.outcome}' for a in attempts]}"
                 f" | prompt={attempts[-1].prompt_version}"
             )
             for f, ok in correct.items():

@@ -250,3 +250,94 @@ async def test_sync_capacity_rejects_instead_of_queueing() -> None:
     async with service._sync_slots:  # the only slot is busy
         with pytest.raises(SyncCapacityExhaustedError):
             await service.extract_sync(cast(Any, None), INVOICE, request_id="r", client_id=None)
+
+
+# ----------------------------------------------------------------------------- model failover
+FALLBACK = "gemini-3.5-flash-lite"
+
+
+async def _run_with_fallback(gemini: ScriptedGemini) -> tuple[object, list[Attempt]]:
+    attempts: list[Attempt] = []
+    outcome = await pipeline_with(gemini, fallback=FALLBACK).run(
+        document=b"%PDF-1.7 fake",
+        mime_type="application/pdf",
+        spec=INVOICE,
+        deadline=time.monotonic() + 30,
+        attempts=attempts,
+    )
+    return outcome, attempts
+
+
+async def test_overloaded_primary_fails_over_with_model_specific_thinking_level() -> None:
+    gemini = ScriptedGemini(
+        call_error(503), call_error(429), call_error(503), response(invoice_payload())
+    )
+    _, attempts = await _run_with_fallback(gemini)
+    assert [(a.model, a.outcome) for a in attempts] == [
+        ("gemini-3.8-flash", "RETRYABLE_ERROR"),
+        ("gemini-3.8-flash", "RETRYABLE_ERROR"),
+        ("gemini-3.8-flash", "RETRYABLE_ERROR"),
+        (FALLBACK, "SUCCESS"),
+    ]
+    # each model gets the thinking level it actually supports ("low" would 400 on Flash-Lite)
+    assert [c["thinking_level"] for c in gemini.calls] == ["low", "low", "low", "minimal"]
+    assert gemini.calls[-1]["model"] == FALLBACK
+    assert attempts[-1].cost_usd is not None  # priced at the fallback model's own rate
+
+
+async def test_failover_is_sticky_for_the_rest_of_the_request() -> None:
+    gemini = ScriptedGemini(
+        *(call_error(503) for _ in range(3)),
+        response('{"invoice_number": "oops"}'),  # fallback answers, but invalid -> repair
+        response(invoice_payload()),
+    )
+    _, attempts = await _run_with_fallback(gemini)
+    assert [c["model"] for c in gemini.calls[3:]] == [FALLBACK, FALLBACK]  # no return to primary
+    assert [a.outcome for a in attempts[3:]] == ["INVALID_OUTPUT", "SUCCESS"]
+
+
+async def test_bad_request_never_fails_over() -> None:
+    gemini = ScriptedGemini(call_error(400, retryable=False))
+    with pytest.raises(ExtractionFailedError):
+        await _run_with_fallback(gemini)
+    assert [c["model"] for c in gemini.calls] == ["gemini-3.8-flash"]
+
+
+async def test_both_models_down_is_upstream_unavailable() -> None:
+    gemini = ScriptedGemini(*(call_error(503) for _ in range(6)))
+    attempts: list[Attempt] = []
+    with pytest.raises(UpstreamUnavailableError):
+        await pipeline_with(gemini, fallback=FALLBACK).run(
+            document=b"%PDF-",
+            mime_type="application/pdf",
+            spec=INVOICE,
+            deadline=time.monotonic() + 30,
+            attempts=attempts,
+        )
+    assert [a.model for a in attempts] == ["gemini-3.8-flash"] * 3 + [FALLBACK] * 3
+
+
+def test_build_pipeline_gives_primary_fewer_attempts_when_fallback_exists() -> None:
+    from types import SimpleNamespace
+
+    from docintel.api.resources import build_pipeline
+    from tests.conftest import make_settings
+
+    client = SimpleNamespace(aio=None)
+    with_fallback = build_pipeline(make_settings(), client)  # type: ignore[arg-type]
+    assert with_fallback._models == ["gemini-3.8-flash", FALLBACK]
+    assert with_fallback._retry_policy.max_attempts == 2
+    assert with_fallback._fallback_policy.max_attempts == 3
+    disabled = build_pipeline(make_settings(gemini_fallback_model=""), client)  # type: ignore[arg-type]
+    assert disabled._models == ["gemini-3.8-flash"]
+    assert disabled._retry_policy.max_attempts == 3
+
+
+def test_fallback_model_has_a_price_and_a_thinking_level() -> None:
+    from docintel.extraction.model_profiles import thinking_level_for
+    from docintel.settings import Settings
+
+    model = Settings.model_fields["gemini_fallback_model"].default
+    assert price_for(model).input_per_mtok == Decimal("0.30")
+    assert thinking_level_for(model) == "minimal"
+    assert thinking_level_for("gemini-3.8-flash") == "low"

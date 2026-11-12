@@ -343,6 +343,37 @@
         "title": "ReadinessResponse",
         "type": "object"
       },
+      "SchemaSummary": {
+        "properties": {
+          "critical_fields": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Critical Fields",
+            "type": "array"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "max_pages": {
+            "title": "Max Pages",
+            "type": "integer"
+          },
+          "schema_id": {
+            "title": "Schema Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_id",
+          "description",
+          "max_pages",
+          "critical_fields"
+        ],
+        "title": "SchemaSummary",
+        "type": "object"
+      },
       "SubmitResponse": {
         "description": "``mode=async`` (202): the job is queued; poll ``status_url``.",
         "properties": {
@@ -727,6 +758,31 @@
         "summary": "Get Job",
         "tags": [
           "jobs"
+        ]
+      }
+    },
+    "/api/v1/schemas": {
+      "get": {
+        "operationId": "list_schemas_api_v1_schemas_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SchemaSummary"
+                  },
+                  "title": "Response List Schemas Api V1 Schemas Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Schemas",
+        "tags": [
+          "schemas"
         ]
       }
     },

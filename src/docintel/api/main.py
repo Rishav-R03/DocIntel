@@ -14,10 +14,11 @@ from fastapi import FastAPI
 from docintel.api.errors import install_problem_openapi, register_exception_handlers
 from docintel.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
 from docintel.api.resources import ResourcesFactory, build_resources
-from docintel.api.routes import extract, health, jobs
+from docintel.api.routes import extract, health, jobs, schemas
 from docintel.ingestion.upload import MULTIPART_OVERHEAD_BYTES
 from docintel.logging import configure_logging
 from docintel.settings import Settings, get_settings
+from docintel.web import mount_demo_ui
 
 log = structlog.get_logger(__name__)
 
@@ -57,5 +58,8 @@ def create_app(
     app.include_router(health.router)
     app.include_router(extract.router)
     app.include_router(jobs.router)
+    app.include_router(schemas.router)
+    if settings.env in ("local", "dev"):  # demo UI; never in staging/prod
+        mount_demo_ui(app)
     install_problem_openapi(app)
     return app

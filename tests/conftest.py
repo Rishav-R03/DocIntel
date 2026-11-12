@@ -51,3 +51,9 @@ def fake_resources(*checks: FakeCheck) -> ResourcesFactory:
 @pytest.fixture
 def settings() -> Settings:
     return make_settings()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests must never see (or depend on) a developer's real credentials."""
+    monkeypatch.delenv("DOCINTEL_GEMINI_API_KEY", raising=False)

@@ -24,6 +24,9 @@ Extract the general fields defined by the response schema.
 - `summary` is at most three sentences and only restates what the document says."""
 
 CRITICAL_FIELDS = ("document_type", "title")
+# Enforced here, not as maxItems in the wire schema: an array-length cap on nested objects blows
+# up Gemini's constrained-decoding grammar ("too many states for serving", HTTP 400 on Flash-Lite).
+MAX_KEY_VALUES = 50
 
 
 class KeyValueWire(WireModel):
@@ -36,7 +39,9 @@ class GenericDocumentWire(WireModel):
     document_type: ConfidentStr
     document_date: ConfidentDate
     parties: list[ConfidentStr] = Field(description="People or organisations named as parties.")
-    key_values: list[KeyValueWire] = Field(max_length=50)
+    key_values: list[KeyValueWire] = Field(
+        description="Labelled fields as printed, most important first, at most 50."
+    )
     summary: ConfidentStr
     document_validity_score: float = Field(ge=0, le=1)
 
@@ -67,10 +72,18 @@ def to_domain(wire: GenericDocumentWire) -> tuple[GenericDocument, list[Extracti
                 key=c.field(f"key_values[{i}].key", kv.key, parse_text),
                 value=c.field(f"key_values[{i}].value", kv.value, parse_text),
             )
-            for i, kv in enumerate(wire.key_values)
+            for i, kv in enumerate(wire.key_values[:MAX_KEY_VALUES])
         ],
         summary=c.field("summary", wire.summary, parse_text),
     )
+    if len(wire.key_values) > MAX_KEY_VALUES:
+        c.warnings.append(
+            ExtractionWarning(
+                code="TRUNCATED",
+                field="key_values",
+                detail=f"kept the first {MAX_KEY_VALUES} of {len(wire.key_values)} key-value pairs",
+            )
+        )
     return document, c.warnings
 
 

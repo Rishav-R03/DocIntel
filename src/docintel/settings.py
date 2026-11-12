@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # retired on Vertex AI as of 2026-10, so the default is its GA successor (journal, Phase 3).
     gemini_api_key: SecretStr | None = None  # required outside `local`
     gemini_model: str = "gemini-3.8-flash"
+    # On retryable failures (503 / 429 / timeout) after `gemini_fallback_after_attempts` tries,
+    # the request moves to this model. Empty string disables failover.
+    gemini_fallback_model: str | None = "gemini-3.5-flash-lite"
+    gemini_fallback_after_attempts: int = Field(default=2, ge=1, le=10)
     gemini_timeout_s: float = Field(default=25.0, gt=0)
     gemini_inline_max_bytes: int = Field(default=14 * 1024 * 1024, gt=0)  # base64 adds ~33 %
     retry_max_attempts_sync: int = Field(default=3, ge=1, le=10)

@@ -13,6 +13,7 @@ Recovery policy per attempt outcome (implementation.md §4.7.4):
 """
 
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -30,6 +31,7 @@ from docintel.domain.errors import (
 )
 from docintel.extraction.confidence import ValidityScore, score
 from docintel.extraction.gemini_client import GeminiCallError, GeminiClient, GeminiResponse
+from docintel.extraction.model_profiles import thinking_level_for
 from docintel.extraction.pricing import UnknownModelPriceError, cost_usd
 from docintel.extraction.prompts import SYSTEM_INSTRUCTION, prompt_version, repair_prompt
 from docintel.extraction.resilience import DeadlineExceededError, RetryPolicy, with_retries
@@ -112,10 +114,16 @@ class ExtractionPipeline:
         *,
         retry_policy: RetryPolicy,
         low_confidence_threshold: float,
+        fallback_model: str | None = None,
+        fallback_policy: RetryPolicy | None = None,
     ) -> None:
         self._gemini = gemini
-        self._retry_policy = retry_policy
+        self._retry_policy = retry_policy  # primary model
+        self._fallback_policy = fallback_policy or retry_policy
         self._low_confidence_threshold = low_confidence_threshold
+        self._models = [gemini.model]
+        if fallback_model and fallback_model != gemini.model:
+            self._models.append(fallback_model)
 
     async def run(
         self,
@@ -130,10 +138,11 @@ class ExtractionPipeline:
         prompt = spec.prompt
         max_tokens = spec.max_output_tokens
         repaired = extended = False
+        active = 0  # index into self._models; sticky once we've failed over
 
         while True:
-            response = await self._call(
-                document, mime_type, spec, prompt, max_tokens, version, deadline, attempts
+            response, active = await self._call(
+                document, mime_type, spec, prompt, max_tokens, version, deadline, attempts, active
             )
             if response.status == "incomplete":
                 self._record(attempts, response, version, "INCOMPLETE")
@@ -189,12 +198,57 @@ class ExtractionPipeline:
         version: str,
         deadline: float,
         attempts: list[Attempt],
-    ) -> GeminiResponse:
+        start: int,
+    ) -> tuple[GeminiResponse, int]:
+        """Try models in order from ``start``. A retryable failure that exhausts one model's
+        policy fails over to the next; non-retryable errors (4xx: our request is wrong) never do.
+        Returns the response and the index of the model that served it."""
+        for index in range(start, len(self._models)):
+            model = self._models[index]
+            has_next = index + 1 < len(self._models)
+            policy = self._retry_policy if index == 0 else self._fallback_policy
+            try:
+                response = await with_retries(
+                    self._attempt_fn(
+                        document, mime_type, spec, prompt, max_tokens, deadline, model
+                    ),
+                    policy=policy,
+                    deadline=deadline,
+                    on_failure=self._failure_recorder(attempts, version, model),
+                )
+                return response, index
+            except DeadlineExceededError as exc:
+                if has_next and deadline - time.monotonic() >= policy.min_attempt_budget_s:
+                    self._log_failover(model, self._models[index + 1], "deadline")
+                    continue
+                raise ExtractionTimeoutError(
+                    "Extraction did not finish within the deadline; retry or use mode=async."
+                ) from exc
+            except GeminiCallError as exc:
+                if exc.retryable and has_next:
+                    self._log_failover(model, self._models[index + 1], exc.error_type)
+                    continue
+                if exc.retryable:
+                    raise UpstreamUnavailableError(
+                        "The AI provider is temporarily unavailable; please retry."
+                    ) from exc
+                raise ExtractionFailedError(
+                    f"The AI provider rejected the request ({exc.error_type})."
+                ) from exc
+        raise RuntimeError("no model configured")  # unreachable: _models is never empty
+
+    @staticmethod
+    def _log_failover(from_model: str, to_model: str, reason: str) -> None:
+        log.warning("gemini_failover", from_model=from_model, to_model=to_model, reason=reason)
+
+    def _failure_recorder(
+        self, attempts: list[Attempt], version: str, model: str
+    ) -> Callable[[int, GeminiCallError], None]:
         def on_failure(_: int, exc: GeminiCallError) -> None:
             attempts.append(
                 Attempt(
                     attempt=len(attempts) + 1,
-                    model=self._gemini.model,
+                    model=model,
                     prompt_version=version,
                     input_mode="UNKNOWN",
                     latency_ms=exc.latency_ms,
@@ -206,11 +260,27 @@ class ExtractionPipeline:
             )
             log.warning(
                 "gemini_call_failed",
+                model=model,
+                attempt=len(attempts),
                 retryable=exc.retryable,
                 http_status=exc.http_status,
                 error_type=exc.error_type,
+                latency_ms=exc.latency_ms,
+                provider_message=exc.provider_message,
             )
 
+        return on_failure
+
+    def _attempt_fn(
+        self,
+        document: bytes,
+        mime_type: str,
+        spec: SchemaSpec,
+        prompt: str,
+        max_tokens: int,
+        deadline: float,
+        model: str,
+    ) -> Callable[[int], Awaitable[GeminiResponse]]:
         async def attempt(_: int) -> GeminiResponse:
             remaining = max(1.0, deadline - time.monotonic())
             return await self._gemini.generate(
@@ -219,46 +289,33 @@ class ExtractionPipeline:
                 system_instruction=SYSTEM_INSTRUCTION,
                 prompt=prompt,
                 json_schema=spec.json_schema,
-                thinking_level=spec.thinking_level,
+                thinking_level=thinking_level_for(model),
                 max_output_tokens=max_tokens,
                 timeout_s=remaining,
+                model=model,
             )
 
-        try:
-            return await with_retries(
-                attempt, policy=self._retry_policy, deadline=deadline, on_failure=on_failure
-            )
-        except DeadlineExceededError as exc:
-            raise ExtractionTimeoutError(
-                "Extraction did not finish within the deadline; retry or use mode=async."
-            ) from exc
-        except GeminiCallError as exc:
-            if exc.retryable:
-                raise UpstreamUnavailableError(
-                    "The AI provider is temporarily unavailable; please retry."
-                ) from exc
-            raise ExtractionFailedError(
-                f"The AI provider rejected the request ({exc.error_type})."
-            ) from exc
+        return attempt
 
     def _record(
         self, attempts: list[Attempt], response: GeminiResponse, version: str, outcome: str
     ) -> None:
         usage = response.usage
+        model = response.model or self._gemini.model
         try:
             cost: Decimal | None = cost_usd(
-                self._gemini.model,
+                model,
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 thought_tokens=usage.thought_tokens,
             )
         except UnknownModelPriceError:
-            log.error("unknown_model_price", model=self._gemini.model)
+            log.error("unknown_model_price", model=model)
             cost = None  # never block an extraction on a missing price; alarm instead
         attempts.append(
             Attempt(
                 attempt=len(attempts) + 1,
-                model=self._gemini.model,
+                model=model,
                 prompt_version=version,
                 input_mode=response.input_mode,
                 latency_ms=response.latency_ms,
