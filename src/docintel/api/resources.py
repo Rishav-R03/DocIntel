@@ -14,14 +14,15 @@ from google import genai
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docintel.aws import client_kwargs, create_session
-from docintel.extraction.gemini_client import GeminiClient, create_genai_client
+from docintel.extraction.factory import build_pipeline
+from docintel.extraction.gemini_client import create_genai_client
 from docintel.extraction.pipeline import ExtractionPipeline
-from docintel.extraction.resilience import RetryPolicy
-from docintel.health import DatabaseCheck, HealthCheck, S3BucketCheck
+from docintel.health import DatabaseCheck, EventListenerCheck, HealthCheck, S3BucketCheck
 from docintel.ingestion.service import IngestionService
 from docintel.ingestion.staging import DocumentStore
 from docintel.messaging import JobQueue
 from docintel.persistence.db import create_engine, create_session_factory
+from docintel.persistence.events import EventBroker
 from docintel.settings import Settings
 
 log = structlog.get_logger(__name__)
@@ -32,33 +33,10 @@ class Resources:
     health_checks: tuple[HealthCheck, ...]
     session_factory: async_sessionmaker[AsyncSession]
     ingestion: IngestionService
+    events: EventBroker
 
 
 ResourcesFactory = Callable[[Settings], AbstractAsyncContextManager[Resources]]
-
-
-def build_pipeline(settings: Settings, client: genai.Client) -> ExtractionPipeline:
-    gemini = GeminiClient(
-        client,
-        model=settings.gemini_model,
-        timeout_s=settings.gemini_timeout_s,
-        inline_max_bytes=settings.gemini_inline_max_bytes,
-    )
-    fallback = settings.gemini_fallback_model or None  # "" disables failover
-    if fallback == settings.gemini_model:
-        fallback = None
-    # With a fallback available, give the primary fewer tries: during a provider brown-out, failing
-    # over quickly beats burning the sync deadline (and free-tier quota) on an overloaded model.
-    primary_attempts = (
-        settings.gemini_fallback_after_attempts if fallback else settings.retry_max_attempts_sync
-    )
-    return ExtractionPipeline(
-        gemini,
-        retry_policy=RetryPolicy(max_attempts=primary_attempts),
-        fallback_model=fallback,
-        fallback_policy=RetryPolicy(max_attempts=settings.retry_max_attempts_sync),
-        low_confidence_threshold=settings.confidence_threshold,
-    )
 
 
 @asynccontextmanager
@@ -88,13 +66,21 @@ async def build_resources(
                 queue=JobQueue(sqs, settings.sqs_jobs_url),
                 pipeline=pipeline,
             )
+            events = EventBroker(settings)
+            await events.start()
             try:
                 yield Resources(
-                    health_checks=(DatabaseCheck(engine), S3BucketCheck(s3, settings.s3_bucket)),
+                    health_checks=(
+                        DatabaseCheck(engine),
+                        S3BucketCheck(s3, settings.s3_bucket),
+                        EventListenerCheck(events),
+                    ),
                     session_factory=session_factory,
                     ingestion=ingestion,
+                    events=events,
                 )
             finally:
+                await events.stop()
                 await ingestion.drain()  # before clients close: persistence still needs them
     finally:
         if gemini is not None:

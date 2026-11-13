@@ -72,6 +72,14 @@ class Settings(BaseSettings):
     worker_concurrency: int = Field(default=16, ge=1, le=256)
     worker_drain_timeout_s: float = Field(default=25.0, gt=0)
     sqs_wait_time_s: int = Field(default=20, ge=0, le=20)
+    sqs_visibility_timeout_s: int = Field(default=180, ge=30, le=43_200)  # = queue setting (TF)
+    worker_job_deadline_s: float = Field(default=120.0, gt=0)
+    worker_max_receives: int = Field(default=3, ge=1)  # = DLQ maxReceiveCount (TF / bootstrap)
+    retry_max_attempts_async: int = Field(default=5, ge=1, le=10)
+
+    # ---- live progress (SSE)
+    sse_heartbeat_s: float = Field(default=15.0, gt=0)
+    sse_max_duration_s: float = Field(default=600.0, gt=0)
 
     @model_validator(mode="after")
     def _enforce_cloud_safety(self) -> "Settings":

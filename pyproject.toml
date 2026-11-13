@@ -58,7 +58,7 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106"]          # asserts and fake credentials in tests
+"tests/**" = ["S101", "S105", "S106", "N803"]  # asserts, fake creds, AWS-style fake APIs
 "migrations/versions/**" = ["E501"]
 
 # --------------------------------------------------------------------------- mypy
@@ -70,7 +70,7 @@ packages = ["docintel"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["aioboto3.*", "botocore.*"]
+module = ["aioboto3.*", "botocore.*", "asyncpg.*"]
 ignore_missing_imports = true
 
 # --------------------------------------------------------------------------- pytest

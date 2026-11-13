@@ -43,6 +43,7 @@ def fake_resources(*checks: FakeCheck) -> ResourcesFactory:
             health_checks=checks,
             session_factory=cast(Any, None),
             ingestion=cast(Any, None),
+            events=cast(Any, None),
         )
 
     return factory

@@ -63,6 +63,20 @@ def test_score_combines_model_rules_and_critical_confidence() -> None:
     assert result.low_confidence_fields == ("b",)
 
 
+def test_missing_fields_are_not_reported_as_low_confidence() -> None:
+    result = score(
+        model_validity=0.9,
+        violations=[],
+        critical_confidences=[0.0, 0.95],
+        field_confidences={"date": 0.0, "name": 0.5, "total": 0.95},
+        low_confidence_threshold=0.7,
+        missing_fields=["date"],
+    )
+    assert result.missing_fields == ("date",)
+    assert result.low_confidence_fields == ("name",)
+    assert result.adjusted < 0.9  # a missing *critical* field still lowers the score
+
+
 def test_score_is_capped_by_model_validity_when_everything_is_confident() -> None:
     result = score(
         model_validity=0.8,
@@ -158,7 +172,8 @@ async def test_successful_extraction_scores_and_audits() -> None:
     assert outcome.data["invoice_date"]["value"] == "2026-10-01"
     assert outcome.warnings == []
     assert 0.9 < outcome.validity.adjusted <= 0.96
-    assert outcome.validity.low_confidence_fields == ("vendor_tax_id",)
+    assert outcome.validity.low_confidence_fields == ()
+    assert outcome.validity.missing_fields == ("vendor_tax_id",)  # absent, not "unsure"
     [attempt] = attempts
     assert (attempt.outcome, attempt.input_tokens, attempt.thought_tokens) == ("SUCCESS", 2000, 200)
     assert attempt.cost_usd is not None
@@ -320,7 +335,7 @@ async def test_both_models_down_is_upstream_unavailable() -> None:
 def test_build_pipeline_gives_primary_fewer_attempts_when_fallback_exists() -> None:
     from types import SimpleNamespace
 
-    from docintel.api.resources import build_pipeline
+    from docintel.extraction.factory import build_pipeline
     from tests.conftest import make_settings
 
     client = SimpleNamespace(aio=None)
@@ -341,3 +356,66 @@ def test_fallback_model_has_a_price_and_a_thinking_level() -> None:
     assert price_for(model).input_per_mtok == Decimal("0.30")
     assert thinking_level_for(model) == "minimal"
     assert thinking_level_for("gemini-3.8-flash") == "low"
+
+
+# ----------------------------------------------------------------------------- quota + budget
+DAILY_QUOTA_MSG = (
+    "Rate limit exceeded for model gemini-3.8-flash (limit: 20 requests per day on Free Tier). "
+    "Please retry in 15h59m52s or upgrade your tier"
+)
+
+
+@pytest.mark.parametrize(
+    ("message", "seconds"),
+    [
+        (DAILY_QUOTA_MSG, 15 * 3600 + 59 * 60 + 52),
+        ("Please retry in 30s.", 30.0),
+        ("please retry in 1m5.5s", 65.5),
+        ("high demand, try again later", None),
+        (None, None),
+    ],
+)
+def test_retry_delay_parsed_from_provider_prose(message: str | None, seconds: float | None) -> None:
+    from docintel.extraction.gemini_client import retry_delay_from_message
+
+    assert retry_delay_from_message(message) == seconds
+
+
+async def test_retry_after_beyond_deadline_stops_retrying_immediately() -> None:
+    calls: list[int] = []
+
+    async def call(attempt: int) -> str:
+        calls.append(attempt)
+        raise call_error(429, retry_after_s=57_592)
+
+    with pytest.raises(Exception, match="HTTP 429"):  # the retryable error itself, not a timeout
+        await with_retries(
+            call, policy=FAST_RETRIES, deadline=time.monotonic() + 30, on_failure=lambda *_: None
+        )
+    assert calls == [1]
+
+
+async def test_daily_quota_429_fails_over_after_one_attempt() -> None:
+    gemini = ScriptedGemini(call_error(429, retry_after_s=57_592), response(invoice_payload()))
+    _, attempts = await _run_with_fallback(gemini)
+    assert [(a.model, a.http_status) for a in attempts] == [
+        ("gemini-3.8-flash", 429),
+        (FALLBACK, None),
+    ]
+
+
+async def test_daily_quota_without_fallback_is_503_not_a_timeout() -> None:
+    with pytest.raises(UpstreamUnavailableError):
+        await _run(ScriptedGemini(call_error(429, retry_after_s=57_592)))
+
+
+async def test_primary_attempt_keeps_budget_in_reserve_for_failover() -> None:
+    gemini = ScriptedGemini(response(invoice_payload()))
+    await _run_with_fallback(gemini)  # 30 s deadline
+    assert gemini.calls[0]["timeout_s"] <= 15.0  # at most half: the rest is for the fallback
+
+
+async def test_last_resort_model_gets_the_whole_remaining_budget() -> None:
+    gemini = ScriptedGemini(response(invoice_payload()))
+    await _run(gemini)  # no fallback configured: primary is the last resort
+    assert gemini.calls[0]["timeout_s"] > 25.0

@@ -17,6 +17,7 @@ disables SDK retries so exactly one layer (extraction/resilience.py) owns them.
 
 import base64
 import io
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -96,6 +97,21 @@ def _retry_after(headers: Any) -> float | None:
         return None  # HTTP-date form; fall back to our own backoff
 
 
+_RETRY_IN = re.compile(
+    r"retry in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+(?:\.\d+)?)s)?", re.IGNORECASE
+)
+
+
+def retry_delay_from_message(message: str | None) -> float | None:
+    """Gemini's 429 carries the delay only in prose ("Please retry in 15h59m52s"), not in a
+    Retry-After header. Parse it so a daily-quota 429 is recognised as not worth retrying."""
+    match = _RETRY_IN.search(message or "")
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (float(g) if g else 0.0 for g in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
 def _provider_message(exc: BaseException) -> str | None:
     text = " ".join(str(getattr(exc, "message", None) or exc).split())
     return text[:300] or None
@@ -121,7 +137,8 @@ def classify_error(exc: BaseException, latency_ms: int) -> GeminiCallError:
             http_status=status,
             error_type=type(exc).__name__,
             latency_ms=latency_ms,
-            retry_after_s=_retry_after(getattr(exc, "headers", None)),
+            retry_after_s=_retry_after(getattr(exc, "headers", None))
+            or retry_delay_from_message(_provider_message(exc)),
             provider_message=_provider_message(exc),
         )
     return GeminiCallError(

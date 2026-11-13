@@ -13,7 +13,7 @@ from typing import Any
 
 import structlog
 
-from docintel.worker.handler import MessageHandler
+from docintel.worker.handler import MessageHandler, RetryLaterError
 
 log = structlog.get_logger(__name__)
 
@@ -31,6 +31,7 @@ class Worker:
         concurrency: int,
         wait_time_s: int = 20,
         drain_timeout_s: float = 25.0,
+        visibility_timeout_s: int = 180,
     ) -> None:
         self._sqs = sqs
         self._queue_url = queue_url
@@ -38,6 +39,7 @@ class Worker:
         self._concurrency = concurrency
         self._wait_time_s = wait_time_s
         self._drain_timeout_s = drain_timeout_s
+        self._visibility_timeout_s = visibility_timeout_s
         self._stop = asyncio.Event()
         self._in_flight: set[asyncio.Task[None]] = set()
 
@@ -95,16 +97,41 @@ class Worker:
             receive_count=message.get("Attributes", {}).get("ApproximateReceiveCount"),
             request_id=attributes.get("request_id", {}).get("StringValue"),
         ):
+            heartbeat = asyncio.create_task(self._keep_invisible(message["ReceiptHandle"]))
             try:
                 await self._handler.handle(message)
                 await self._sqs.delete_message(
                     QueueUrl=self._queue_url, ReceiptHandle=message["ReceiptHandle"]
                 )
+            except RetryLaterError as retry:
+                # Bring the redelivery forward (or push it back) instead of waiting out the full
+                # visibility timeout: this is the backoff between async attempts.
+                log.info("message_retry_scheduled", delay_s=retry.delay_s, reason=str(retry))
+                await self._set_visibility(message["ReceiptHandle"], retry.delay_s)
             except asyncio.CancelledError:
                 log.warning("message_processing_cancelled")
                 raise
             except Exception:
                 log.exception("message_processing_failed")
+            finally:
+                heartbeat.cancel()
+
+    async def _keep_invisible(self, receipt_handle: str) -> None:
+        """While a job runs, keep extending the message's visibility so SQS doesn't hand it to a
+        second worker mid-extraction. If this worker dies, extensions stop and the message
+        reappears within one visibility period."""
+        interval = max(1.0, self._visibility_timeout_s / 3)
+        while True:
+            await asyncio.sleep(interval)
+            await self._set_visibility(receipt_handle, self._visibility_timeout_s)
+
+    async def _set_visibility(self, receipt_handle: str, seconds: int) -> None:
+        try:
+            await self._sqs.change_message_visibility(
+                QueueUrl=self._queue_url, ReceiptHandle=receipt_handle, VisibilityTimeout=seconds
+            )
+        except Exception:
+            log.warning("visibility_update_failed", exc_info=True)  # worst case: redelivery
 
     async def _wait_for_slot_or_stop(self) -> None:
         stopped = asyncio.ensure_future(self._stop.wait())

@@ -9,8 +9,8 @@ The plan lives in [implementation.md](../implementation.md) and the product requ
 | 0: Inception & detailed design | Partially done (plan written; stakeholder items open) | [see below](#phase-0-inception--status-note) |
 | 1: Foundation & walking skeleton | ✅ Code-complete and verified locally; AWS apply pending account access | [Phase 1](#phase-1-foundation--walking-skeleton) |
 | 2: Ingestion & staging | ✅ Complete and verified locally; KMS/checksum enforcement to confirm in AWS dev | [Phase 2](#phase-2-ingestion--staging-pipeline) |
-| 3: Extraction engine & sync API | Not started | |
-| 4: Async processing & SSE | Not started | |
+| 3: Extraction engine & sync API | ✅ Complete; verified live on real Gemini. Primary-model latency and golden-set accuracy pending (provider overload, no labelled set) | [Phase 3](#phase-3-extraction-engine--sync-api) |
+| 4: Async processing & SSE | ✅ Complete; verified live on real Gemini. SSE load targets pending (Phase 8) | [Phase 4](#phase-4-async-processing--live-progress-sse) |
 | 5: Audit, cost & persistence | Not started | |
 | 6: Reliability & security hardening | Not started | |
 | 7: Production infra & CD | Not started | |
@@ -413,3 +413,335 @@ Auto-increment leaks volume and is guessable in URLs. UUIDv4 is unguessable but 
 SQS is at-least-once, so that can happen. The claim is one conditional `UPDATE ... WHERE status = 'STAGED' RETURNING`. Exactly one worker's update matches; the other gets no row back and just acks the message. No row locks are held during the long AI call.
 
 **Numbers to remember:** 25 MiB per file · +256 KiB request overhead · 64 KiB form fields · 10 parts max · 1 MiB in-memory spool · 8-byte sniff window · 50 pages · 50 MP images · `Retry-After: 5` · 99 tests / 94 % coverage · 0 body bytes sent before a 413 on oversize.
+
+---
+
+## Phase 3: Extraction Engine & Sync API
+
+### 3.1 Goal
+
+Turn a validated document into **schema-validated JSON with field-level confidence**, synchronously (FR-04, FR-05, FR-06, FR-08, FR-10). This means the model integration, per-document-type schemas, business-rule validation, scoring, cost accounting, retries, and `mode=sync` with an audit trail.
+
+### 3.2 What we built
+
+| Area | What exists now | Key files |
+|---|---|---|
+| Schemas | 4 types (`invoice`, `financial_statement`, `contract`, `generic_document`), each a **wire** model (what Gemini fills) plus a strict **domain** model (`Decimal`, `date`, ISO codes) and business rules | [schemas/](../src/docintel/schemas/) |
+| Schema registry | Converts Pydantic to Gemini JSON Schema; **rejects unsupported keywords at import time** (startup + CI) | [schemas/registry.py](../src/docintel/schemas/registry.py) |
+| Gemini adapter | Interactions API, inline or Files API input, `store=False`, SDK retries off, error classification, provider message capture | [extraction/gemini_client.py](../src/docintel/extraction/gemini_client.py) |
+| Retry policy | Deadline-aware, full jitter, honours `Retry-After`, reports every attempt | [extraction/resilience.py](../src/docintel/extraction/resilience.py) |
+| Model failover | Primary → fallback on retryable failure, sticky per request; per-model thinking level | [extraction/pipeline.py](../src/docintel/extraction/pipeline.py), [model_profiles.py](../src/docintel/extraction/model_profiles.py) |
+| Pipeline | Repair retry on invalid JSON, token-budget retry on truncation, domain conversion, rules, scoring | [extraction/pipeline.py](../src/docintel/extraction/pipeline.py) |
+| Scoring | Adjusted validity = model score × rule penalties × critical-field confidence; `low_confidence_fields` vs `missing_fields` | [extraction/confidence.py](../src/docintel/extraction/confidence.py) |
+| Pricing | Effective-dated prices per model; thinking billed as output | [extraction/pricing.py](../src/docintel/extraction/pricing.py) |
+| Sync API | `POST /api/v1/extract?mode=sync`: S3 staging in parallel with Gemini, persistence after the response, capacity guard | [ingestion/service.py](../src/docintel/ingestion/service.py), [routes/extract.py](../src/docintel/api/routes/extract.py) |
+| Schemas API | `GET /api/v1/schemas` | [routes/schemas.py](../src/docintel/api/routes/schemas.py) |
+| Contract | OpenAPI now documents `400`/problem+json everywhere (fixed Phase 2's 422 mismatch) | [api/errors.py](../src/docintel/api/errors.py) |
+| Demo UI | Vanilla JS + vendored Bootstrap at `/ui` (local/dev only), strict CSP, renders untrusted output as text only | [web/](../src/docintel/web/) |
+| Live tooling | `live` compose service (opt-in, sees `.env`); `scripts/live_smoke.py` with a synthetic invoice of known truth | [scripts/live_smoke.py](../scripts/live_smoke.py) |
+| Tests | **178** (79 new), **95 %** coverage. Gemini is scripted in tests; real-API checks are opt-in | [tests/](../tests/) |
+
+### 3.3 Key decisions and trade-offs
+
+#### D1. Re-researched the model and API before writing code. The PRD's choice was obsolete
+- **Decision:** Default to **`gemini-3.8-flash`** on the **Interactions API**, not the PRD's `gemini-2.5-flash` on `generateContent`.
+- **Why:** On 2026-11-11, `gemini-2.5-flash` was closed to new projects on the Gemini API and retired on Vertex AI. Google calls Interactions "the recommended standard API for all new projects". The research also changed four other assumptions:
+  - Thinking can no longer be disabled (`thinking_budget=0` is gone; `thinking_level` replaces it).
+  - `temperature`/`top_p` are deprecated, and future models will reject them with a 400.
+  - Prices are 2.5–3× the plan's.
+  - Schemas are now plain JSON Schema.
+- **Cost:** The SDK's Interactions client and its error classes live in a **private** package (`google.genai._gaos`). We confined those imports to one adapter module and pinned their behaviour with tests, so an SDK upgrade that moves them fails CI instead of breaking production silently.
+
+#### D2. Wire model ≠ domain model (ADR-04, now proven)
+- **Decision:** Gemini fills a wire model of simple JSON types, where every field is `{value, confidence, page}`. We convert it to a strict domain model. A field that fails to convert becomes `null` with confidence 0 and an `UNPARSEABLE_VALUE` warning, instead of failing the document.
+- **Why:** Money must never be a float (`Decimal(str(v)).quantize("0.01")`), and dates must be real dates. Models produce `"31/02/2026"` and `"dollars"`. Tolerating that per field keeps 95 % of a document useful when 5 % is garbage.
+- **Cost:** Each schema needs a conversion function. It's mechanical, but it's code.
+
+#### D3. A schema check that rejects even the constraints Gemini *ignores*
+- **Decision:** The registry walks every generated JSON Schema. It strips descriptive keys (`title`, `default`) and **raises** on any keyword outside Gemini's supported set, including `maxLength`/`pattern`, which Gemini documents as ignored. Since a real-world 400 (P8), it also rejects **length limits on arrays of objects**.
+- **Why:** An ignored constraint is worse than a missing one: you believe it's enforced. Running the check at import time means a bad schema fails at startup and in CI, never on a customer's request.
+- **Cost:** Limits that Gemini can't express (string lengths, list caps) are enforced in our domain conversion instead (e.g. `MAX_KEY_VALUES`, with a `TRUNCATED` warning).
+
+#### D4. Never return the model's confidence alone
+- **Decision:** `document_validity_score` = model self-assessment × Π(rule penalties) × min(1, mean critical-field confidence / 0.9). The raw model score is returned next to it.
+- **Business rules:**
+  - invoice: line items sum to the subtotal, subtotal + tax = total, date sanity, due date after issue date;
+  - financial statement: assets = liabilities + equity;
+  - contract: term not reversed, at least two parties.
+- **Why:** Live data confirmed the concern from the plan's risk register. The model reported **1.0** validity and **0.95** on nearly every field, on a study guide. Self-reported confidence is not calibrated. Rules catch what the model can't be trusted to check.
+- **Cost:** The penalty weights are guesses until Phase 8 calibrates them against labelled documents.
+
+#### D5. "Missing" is not "uncertain"
+- **Decision:** `null` values go to `missing_fields`, and `low_confidence_fields` contains only values that were found but are shaky. A missing *critical* field still lowers the score.
+- **Why:** In the first live result, `document_date` (correctly absent from a study guide) was flagged as low confidence. That's noise that trains reviewers to ignore the flag. These are two different signals for downstream human review.
+
+#### D6. One retry layer, and it's ours
+- **Decision:** A hand-written `with_retries`:
+  - exponential backoff with **full jitter**;
+  - honours `Retry-After`;
+  - **never starts an attempt that can't finish before the deadline**;
+  - calls `on_failure` for every attempt (the audit trail).
+
+  The SDK's own retries are disabled (P3).
+- **Why not tenacity:** These three requirements interact (the deadline, `Retry-After` and audit callbacks), and 40 readable lines beat configuring around a general library.
+- **Classification:** 408/429/5xx and connection errors are retryable. 400/401/403/404 and **unknown errors** are fatal, since retrying something you don't understand just burns quota.
+
+#### D7. Model failover, with per-model settings
+- **Decision:** With `gemini-3.5-flash-lite` configured as the fallback:
+  - the primary gets 2 attempts, then the request **fails over** inside the same deadline;
+  - the switch is **sticky** for the rest of that request, so a repair retry doesn't go back to the overloaded model;
+  - 4xx errors never fail over (our request is wrong; another model won't fix it);
+  - every attempt is audited and priced under the model that actually ran.
+- **Why:** The provider was overloaded on and off for two days of live testing. Failover turned "every request fails" into **9/9 fields correct on all three live runs**.
+- **Lesson baked in:** thinking levels are **not portable**. 3.8 Flash rejects `minimal` and accepts `low`; Flash-Lite documents `minimal`/`medium`/`high` and never `low`. The level is a property of the model (`model_profiles.py`), not of the schema.
+
+#### D8. Sync mode keeps S3 and Postgres off the critical path
+- **Decision:** S3 staging runs **concurrently** with the Gemini call (`asyncio.create_task`). Job, events, result and audit rows are written by a background task **after** the response is sent, and the lifespan drains those tasks on shutdown.
+- **Why:** Neither backing store adds latency or can fail the request (NFR-05, tested): with the database down the client still gets its result, and the audit record goes to a structured `audit_fallback` log line.
+- **Retention:** source deleted on COMPLETED (data minimisation), kept on FAILED (can be re-driven, and expires via the lifecycle rule).
+- **Cost:** a "200 OK" doesn't guarantee the audit row exists yet. That's accepted; Phase 5 adds automated replay of the fallback log.
+
+#### D9. Fail fast on capacity rather than queueing
+- **Decision:** `SYNC_MAX_CONCURRENCY` (32) uses a semaphore checked with `locked()` before acquiring, returning `429 SYNC_CAPACITY_EXHAUSTED` + `Retry-After: 2` instead of waiting.
+- **Why:** A sync caller queued behind 32 others would blow its own deadline anyway. Telling it immediately lets it retry or switch to async. There's no `await` between the check and the acquire, so it can't race.
+
+#### D10. Privacy defaults that don't depend on vendor defaults
+- **Decision:** Every Interactions call sends `store=False`, pinned by a test.
+- **Why:** The API can persist requests and responses server-side, and the default isn't documented. For financial documents that must be opt-in.
+- **Related finding:** On the **free tier, Google may use the data to improve its products** (pricing page: "Used to improve our products: Yes"). Real documents require the paid tier (plan assumption A-5).
+
+#### D11. Prices are code, effective-dated
+- **Decision:** `PRICES[model] = (Price(from, in, out), ...)`, using the rate in force when the call ran. Thinking tokens are billed at the output rate (confirmed on the pricing page). An unknown model logs an error and records `cost=None`. It **never blocks** an extraction.
+- **Why:** 3.8 Flash's price **doubles on 2027-01-01**, and a config file would let someone change prices without review. Live check: 2,405 in × $0.30/M + 2,161 out × $2.50/M = **$0.006124**, exactly what was recorded.
+
+#### D12. A demo UI that doesn't weaken the security posture
+- **Decision:**
+  - Plain HTML/JS with vendored Bootstrap, verified against the official SRI hashes;
+  - served by the API at `/ui` only in local/dev;
+  - all model output written via `textContent`;
+  - strict CSP: same-origin script, no inline code, `frame-ancestors 'none'`.
+
+  Static tests fail the build on `.innerHTML`, inline `<script>`, `style=` or external URLs.
+- **Why:** Extracted values come from **untrusted documents**. A PDF containing `<script>` text will be faithfully extracted by the model. The UI must treat model output like user input.
+
+### 3.4 Problems we hit (and how we solved them)
+
+| # | Problem | Root cause | Fix / lesson |
+|---|---|---|---|
+| P1 | The PRD's model was unusable | `gemini-2.5-flash` closed to new projects and retired on Vertex AI (Oct 2026) | Research first; `gemini-3.8-flash` via config; recorded as a PRD deviation. **Lesson:** a model ID in a requirements doc is a dependency with an expiry date. |
+| P2 | The plan's latency lever disappeared | Gemini 3.x can't turn thinking off; `minimal` is rejected by 3.8 Flash | `thinking_level="low"`; latency became a measured risk instead of an assumption |
+| P3 | One "attempt" took ~27 s and the deadline never fired; the audit showed 1 attempt where ~5 happened | **The SDK retries silently by default (5 attempts / 30 s)** under our own policy | `create_genai_client()` sets `retry_options.attempts=1`; a regression test asserts the SDK's own config translates to 0 retries. **Lesson:** check every layer for retries. Stacked retries multiply calls into an outage. |
+| P4 | A test's error log contained **`'password': 'docintel'`** | structlog's default `dict_tracebacks` serialises **every frame's local variables**, and asyncpg's connect frame holds the password | `ExceptionDictTransformer(show_locals=False)`; regression test with a runtime-built secret. In production this would have written the RDS password to CloudWatch on every DB error. |
+| P5 | A settings test passed for the wrong reason | Loading `.env` into the `test` container exposed the real Gemini key to the suite | Separate opt-in `live` service; autouse fixture deletes `DOCINTEL_GEMINI_API_KEY` in every test |
+| P6 | The API key was pasted into **`.env.example`** | That file is tracked and the repo has a GitHub remote | Moved to git-ignored `.env` without printing it (only names and lengths shown); confirmed not in any commit or the index |
+| P7 | A Flash-Lite fallback would always have 400'd | Thinking levels differ per model (`low` vs `minimal`) | Per-model profiles; caught by **reading the docs before shipping the fallback**, not in production |
+| P8 | `generic_document.v1` → **400 "too many states for serving"** on Flash-Lite | `maxItems=50` on an array of nested objects explodes the constrained-decoding grammar | Cap moved to domain conversion; the registry now rejects length limits on arrays of objects |
+| P9 | Requests kept failing after the outage cleared | **Free tier: 20 requests/day** on 3.8 Flash, and *failed* 503 retries count against it | Surfaced by logging Gemini's own error text (`provider_message`); README troubleshooting updated; billing recommended |
+| P10 | README promised `docker compose down` keeps data; `live` failed in a fresh clone | Anonymous Postgres volume; image name derived from the folder name | Named `pgdata` volume; fixed image name `docintel-dev:local`. Found by **walking the README end to end on a clean machine state** |
+| P11 | Builds failed on DNS hiccups | `# syntax=docker/dockerfile:1.7` fetches the Dockerfile frontend from Docker Hub on every build | Removed; Docker 29's built-in frontend supports our features |
+| P12 | 71–75 s live latency even though Flash-Lite answered in ~7 s | Each hung primary attempt waited the full per-call timeout (60 s demo override) before failover | Carried forward (§3.7): per-attempt timeouts must reserve budget for failover |
+
+### 3.5 Verification evidence
+
+| Check | Result |
+|---|---|
+| ruff, `mypy --strict` (53 files) | Clean |
+| Tests | **178 passed**, 95 % line+branch coverage |
+| Recovery paths (scripted Gemini) | Repair retry, truncation retry, outage → 503, 400 → 502, deadline → 504, failover, sticky failover, 4xx never fails over, capacity → 429 |
+| Graceful degradation | DB down → 200 + `audit_fallback` log; S3 down → 200; no key → 503 |
+| SDK contract pins | `store=False`, no sampling params, JSON-schema `response_format`, Files API cleanup even on failure, SDK retries = 0, private error classes classified |
+| Live: key and network | Key authenticates; `models.get` 200–350 ms |
+| Live: schema acceptance | `generic_document.v1` and `invoice.v1` accepted by Flash-Lite and validated against the wire models |
+| Live: accuracy (synthetic invoice, known truth) | **9/9 fields correct ×3 runs**, line items exact, no false warnings (served by the fallback) |
+| Live: real 4-page PDF (generic) | COMPLETED; 3 audited attempts (2 × 503 primary, then success on fallback); full event history; source deleted from S3 |
+| Live: cost | $0.002386 (1-page synthetic invoice), $0.006124 (4-page PDF); recomputed by hand, exact |
+| Live: resilience | 503 / 429 / timeouts classified correctly; retries visible; failover observed |
+
+### 3.6 Phase 3 exit criteria
+
+| Criterion | Status |
+|---|---|
+| 100 % of responses validate against the domain model or fail with a documented code | ✅ |
+| Every field carries `confidence`; the response carries `document_validity_score` | ✅ (plus `model_reported_validity`, `low_confidence_fields`, `missing_fields`) |
+| Retries proven with injected 429/503 sequences | ✅ in tests, and observed live |
+| Invoice critical-field accuracy ≥ 90 % on the golden set | 🟡 **100 % on a synthetic invoice (3 runs)**, on the fallback model. No labelled golden set exists yet (a Phase 0 item) |
+| Sync p95 for 3-page PDFs measured (target < 4.0 s) | ⏳ **Not met / not measurable**: the primary model was overloaded for two days; observed 16–75 s, dominated by failed primary attempts. Fallback attempts alone took ~7–9 s |
+
+### 3.7 Known limitations carried forward
+
+- **Timeout budgeting with failover (P12).** A hung primary can consume the deadline before failover. Options: cap each primary attempt at a fraction of the remaining budget, or send a hedged request to the fallback after N seconds. **Next.**
+- **A 429 that says "retry in 15h59m"** is still retried once on the same model, wasting quota. It should fail over immediately.
+- Confidence and validity are uncalibrated (1.0 / 0.95 everywhere observed). Calibrate against a golden set. **Phase 8.**
+- No golden dataset yet, so the accuracy claim rests on one synthetic document.
+- Audit replay from the `audit_fallback` log line. **Phase 5.**
+- Breaker state, metrics and dashboards. **Phase 6.**
+- The demo UI isn't browser-tested in CI (static guards plus manual use only).
+
+### 3.8 Likely interview questions, with answers
+
+**"How do you guarantee the model's output matches your schema?"**
+Three layers:
+1. Gemini's structured output, constrained decoding against a JSON Schema generated from Pydantic, which guarantees shape.
+2. Strict Pydantic validation of the raw response. If that fails, one repair retry quotes the validation errors back to the model, and a second failure returns a documented 502.
+3. Conversion into strict domain types, where a single bad field becomes null with a warning instead of failing the document.
+
+On top of that, a registry check rejects any JSON Schema construct Gemini doesn't enforce, at startup and in CI.
+
+**"Can you trust the model's confidence scores?"**
+No, and we measured that. On a study guide it reported 1.0 validity and 0.95 on almost every field. So the score we return combines the model's self-assessment with deterministic business rules (totals add up, the balance sheet balances) and the confidence on critical fields, and we return the raw score alongside so the adjustment is auditable. Proper calibration needs a labelled dataset; that's planned.
+
+**"Walk me through what happens when Gemini is overloaded."**
+The first attempt gets a 503. Our retry layer backs off with full jitter and tries again within the request's deadline. After two failures on the primary, the request fails over to Flash-Lite with that model's own settings, and stays there. Every attempt is written to the audit table with its model, status, latency, tokens and cost. If everything fails, the client gets a 503 with `Retry-After`, never a hang. Live, this turned an outage where every request failed into 9/9 correct extractions.
+
+**"What was the hardest bug?"**
+Two candidates:
+- **Hidden SDK retries.** One "attempt" took 27 seconds and our deadline logic seemed broken. The Gemini SDK retries five times internally by default, stacked under our retries. That multiplied calls into an already overloaded provider and hid most attempts from the audit log. We turned SDK retries off, and a test pins it.
+- **The traceback that leaked the database password.** The structured logger serialised stack-frame locals by default, and one of those frames was the Postgres driver's connect call.
+
+**"How do you handle the cost of LLM calls?"**
+Every attempt, including failed and repaired ones, is priced from token counts using an effective-dated price table in code, so it's reviewed and the January 2027 price change applies automatically. Thinking tokens are billed at the output rate. A missing price logs an error but never blocks extraction. The numbers reconcile exactly with a hand calculation.
+
+**"Why is the UI safe if the model output comes from untrusted documents?"**
+A malicious PDF can contain HTML or script, and the model will faithfully extract it. The UI only writes values with `textContent`, never `innerHTML`; a test fails the build if anyone adds an HTML sink. The Content-Security-Policy allows only same-origin scripts with no inline code, so even a mistake there can't execute injected script.
+
+**Numbers to remember:** `gemini-3.8-flash` primary / `gemini-3.5-flash-lite` fallback · 2 primary attempts then failover · 30 s sync deadline · 25 s per-call timeout · 32 sync slots · $0.75/$3.75 per 1M tokens (→ $1.50/$7.50 on 2027-01-01) · ~$0.002–0.006 per document · 4 schemas · 178 tests / 95 % coverage · 9/9 fields × 3 live runs.
+
+---
+
+## Phase 4: Async Processing & Live Progress (SSE)
+
+### 4.1 Goal
+
+Make `mode=async` actually process documents: a worker consumes the queue, extracts, persists and publishes progress, and clients watch it live over Server-Sent Events (FR-07, FR-11). It also closes the Phase 3 carry-over on timeout budgeting, so failover works inside a deadline.
+
+### 4.2 What we built
+
+| Area | What exists now | Key files |
+|---|---|---|
+| Extraction handler | Claim (compare-and-set) → load source from S3 → extract → persist result, audit and events → delete source; transient vs permanent failure handling | [worker/extraction_handler.py](../src/docintel/worker/extraction_handler.py) |
+| Runner upgrades | **Visibility heartbeat** while a job runs; `RetryLaterError` reschedules a message with backoff instead of deleting it | [worker/runner.py](../src/docintel/worker/runner.py) |
+| Live events | `pg_notify` written in the same transaction as the event; one LISTEN connection per API process (`EventBroker`) with auto-reconnect | [persistence/events.py](../src/docintel/persistence/events.py) |
+| SSE endpoint | `GET /api/v1/jobs/{id}/stream`: replay after `Last-Event-ID`, live wake-ups, 15 s keep-alive, terminal close, 10 min cap | [api/routes/jobs.py](../src/docintel/api/routes/jobs.py) |
+| Job result | `GET /api/v1/jobs/{id}` returns data, validity, warnings, model and **usage/cost summed across all attempts** once COMPLETED | [api/routes/jobs.py](../src/docintel/api/routes/jobs.py), [repositories.py](../src/docintel/persistence/repositories.py) |
+| Readiness | `events` check (LISTEN connected), reported but never fatal | [health.py](../src/docintel/health.py) |
+| Timeout budgeting | A non-final model may use at most **50 %** of the remaining deadline; a provider "retry in 15h59m" stops same-model retries and fails over immediately | [pipeline.py](../src/docintel/extraction/pipeline.py), [resilience.py](../src/docintel/extraction/resilience.py), [gemini_client.py](../src/docintel/extraction/gemini_client.py) |
+| Refactors | `build_pipeline` → `extraction/factory.py` (the worker doesn't import the API); row mappers → `persistence/records.py` | |
+| UI | Async mode streams a live progress timeline (`EventSource`), including "AI provider busy, retrying in 30 s", then shows the full result | [web/static/app.js](../src/docintel/web/static/app.js) |
+| Tests | **200** (22 new), 94 % coverage, incl. a live NOTIFY → SSE test | [test_async_worker.py](../tests/integration/test_async_worker.py) |
+
+### 4.3 Key decisions and trade-offs
+
+#### D1. Claim with compare-and-set; reclaim only on redelivery
+- **Decision:** `UPDATE jobs SET status='PROCESSING', attempt_count = attempt_count + 1 ... WHERE id=:id AND status IN (:from) RETURNING *`.
+  - `from` is `{STAGED}` on first delivery.
+  - On a **redelivery** (receive count > 1) it's `{STAGED, PROCESSING}`.
+  - A delivery that claims nothing is acked as a duplicate.
+- **Why reclaiming is safe:** the visibility heartbeat keeps a running job's message invisible. The only way a `PROCESSING` job's message becomes visible again is that its worker stopped heartbeating, i.e. died. Without reclaim, a crash would orphan the job in `PROCESSING` forever.
+- **Cost:** If a worker is merely *stalled* (e.g. a long GC pause beyond the 180 s visibility window), two workers could process the same job. The second commit fails the `PROCESSING → VALIDATING` transition and the result is written once; the price is a duplicate model call. Accepted, and documented.
+
+#### D2. The DLQ is a safety net, not the failure path
+- **Decision:**
+  - Transient failures (provider overload, deadline, DB or S3 hiccups) put the job back to `STAGED`, add a `RETRY_SCHEDULED` event, and **shorten the message's visibility to a backoff** (30 → 60 → 120 s, cap 15 min). Without that, every retry would wait the full 180 s.
+  - On the **last allowed receive** (= the queue's `maxReceiveCount`), the handler marks the job `FAILED` and acks.
+  - Permanent failures (bad output, rejected request, missing source) are `FAILED` immediately.
+- **Why:** If we let SQS move the message to the DLQ, the job row would stay `STAGED` forever: the database would say "still waiting" about a job that is dead. With this approach the job's state is always the truth. Only messages we can't even parse reach the DLQ, and they're kept there for inspection.
+- **Cost:** `worker_max_receives` must match the queue's `maxReceiveCount` in Terraform and bootstrap. Both are 3, and the setting's comment says so.
+
+#### D3. Heartbeat the visibility timeout instead of setting it huge
+- **Decision:** 180 s visibility, extended every 60 s while a job runs.
+- **Alternatives:** A 30-minute visibility timeout. That's simple, but a crashed worker's job would then wait 30 minutes to be retried.
+- **Why:** Long jobs stay protected while crash recovery takes at most one visibility period (~3 min). Live evidence: an overloaded Gemini made one job take 58 s, with no duplicate pickup.
+
+#### D4. NOTIFY is a wake-up, the database is the source of truth
+- **Decision:**
+  - The worker inserts each event and calls `pg_notify('job_events', {job_id})` **in the same transaction**, so the notification is delivered only if, and when, it commits.
+  - Each API process holds **one** LISTEN connection and wakes the matching subscribers.
+  - Every SSE stream then reads `job_events WHERE id > last_seen`.
+  - Each stream clears its wake flag *before* reading, so a NOTIFY that arrives mid-read triggers another pass.
+- **Alternatives:** Redis pub/sub (another component to run), or polling only (simple, but adds up to 15 s of latency and a query per stream per tick).
+- **Why:**
+  - **Nothing can be lost.** A dropped, coalesced or missed notification only delays the next database read; `Last-Event-ID` resume falls out of the same query.
+  - **It degrades gracefully.** If the LISTEN connection drops, streams keep working via the 15 s heartbeat poll, and readiness reports `events: unavailable`.
+  - **No new infrastructure.**
+- **Evidence:** a test with a **30 s heartbeat** requires the live events within 10 s, so it passes only via NOTIFY. Live: `VALIDATED`/`COMPLETED` arrived the same second the worker committed.
+- **Cost:** LISTEN needs a dedicated connection that bypasses pooling and RDS Proxy (ADR-03), and each API task holds one extra Postgres connection.
+
+#### D5. SSE without a library
+- **Decision:** A `StreamingResponse` generator:
+  1. sends `retry: 3000` as the first byte (TTFB);
+  2. replays events after `Last-Event-ID`;
+  3. sends a `: keep-alive` comment every 15 s (the ALB idle timeout is 120 s);
+  4. closes on `completed`/`failed` or after 10 minutes.
+
+  Starlette cancels the generator when the client disconnects, and the `subscribe()` context manager unregisters it.
+- **Why:** About 50 lines, and no dependency to download on a flaky network. Our raw-ASGI middleware (Phase 1, D3) was chosen with exactly this in mind.
+- **Limitation:** Browsers' `EventSource` can't send headers, so a job submitted with `X-Client-Id` can't be streamed from a browser. The UI falls back to polling for those. Phase 6 could use short-lived signed stream URLs.
+
+#### D6. Failover needs a time budget (Phase 3 carry-over)
+- **Decision:**
+  - A model that isn't the last resort gets at most **half the remaining deadline** per attempt.
+  - Gemini's 429 hides its retry delay in prose (*"Please retry in 15h59m52s"*), with no `Retry-After` header. We parse it, and if honouring it would overrun the deadline we stop retrying that model at once: fail over, or return **503 + Retry-After** (not a misleading 504).
+- **Why:** Live runs showed a hung primary waiting 60 s and wasting free-tier quota on hopeless retries before failover.
+
+### 4.4 Problems we hit
+
+| # | Problem | Root cause | Fix / lesson |
+|---|---|---|---|
+| P1 | The live async job stayed `STAGED` for 5 minutes | `docker compose build` failed on the network, so the **old Phase 1 worker** (logging placeholder) was still running. It consumed the message and **deleted** it | Rebuilt, recreated, re-verified. **Lessons:** (1) check that a deploy actually rolled, not just that the command ran (we confirmed by importing the new module inside the container); (2) this is exactly the "STAGED with no message" gap the Phase 6 **stuck-job reaper** must close. The orphaned job is still in the local database as a real example. |
+| P2 | ruff B023 on the reconnect callback | A closure inside a loop captured `lost` by reference | Bound it as a default argument. Correct here anyway (one connection per iteration), but explicit is safer |
+| P3 | Polling `is_closed()` every 5 s to detect a dropped LISTEN connection | Wrong tool | asyncpg's `add_termination_listener`: event-driven, no sleep loop |
+| P4 | A test fake's AWS-style parameter names (`QueueUrl`) tripped N803 after reformatting split the line | The formatter moved the `noqa` | Allowed N803 in `tests/**`, since fakes deliberately mirror AWS signatures |
+
+### 4.5 Verification evidence
+
+| Check | Result |
+|---|---|
+| ruff, `mypy --strict` (57 files) | Clean |
+| Tests | **200 passed**, 94 % coverage |
+| Worker paths (real Postgres + moto, scripted Gemini) | Complete; duplicate delivery processed once; 503 → requeue (30 s backoff) → `FAILED` on last receive with 6 audit rows; bad output → permanent `FAILED`; dead worker's job reclaimed on redelivery; missing source → `FAILED`; poison body → raises (DLQ) |
+| SSE | Replay of a finished job + `result_url`; `Last-Event-ID` resume returns only later events; **live via NOTIFY in < 10 s with a 30 s heartbeat** |
+| Runner | `RetryLaterError` reschedules visibility without deleting; heartbeat extends visibility while a job runs |
+| Quota and budget | "retry in 15h59m52s" parsed; daily-quota 429 fails over after 1 attempt; 503 (not 504) without a fallback; primary attempt ≤ 50 % of the budget |
+| **Live, real stack + real Gemini** | async submit → `GEMINI_PROCESSING` instantly → failover to Flash-Lite → `VALIDATED` + `COMPLETED` pushed live the same second → all fields correct, $0.002386 |
+| Live readiness | `{"database":"ok","s3":"ok","events":"ok"}` |
+
+### 4.6 Phase 4 exit criteria
+
+| Criterion | Status |
+|---|---|
+| SSE emits all PRD stages in order | ✅ `UPLOADED → S3_STAGED → GEMINI_PROCESSING → VALIDATED → COMPLETED` (tests and live) |
+| SSE TTFB p95 < 300 ms (100 concurrent streams) | 🟡 First byte is sent before any I/O beyond the job lookup; **not load-tested** (Phase 8 k6) |
+| Killing a worker mid-job → no duplicate results, no lost jobs | ✅ Reclaim-on-redelivery test; duplicate-delivery test; at most one result row |
+| `Last-Event-ID` replays only missed events | ✅ |
+
+### 4.7 Known limitations carried forward
+
+- **Stuck-job reaper:** a job in `STAGED` with no message (P1 is a real instance) or a crash between commit and publish. Re-enqueue jobs stuck longer than N minutes. **Phase 6.**
+- A failed result write re-extracts on redelivery (duplicate cost). Write results to S3 first. **Phase 5.**
+- Browser `EventSource` can't carry `X-Client-Id`, so client-scoped jobs use polling. Signed stream URLs are a later option.
+- The SSE TTFB and 100-stream targets need load testing. **Phase 8.**
+- `worker/__main__.py` wiring is only exercised live, not by unit tests (0 % in coverage).
+
+### 4.8 Likely interview questions, with answers
+
+**"How do you make a queue consumer safe with at-least-once delivery?"**
+Claim with compare-and-set: one `UPDATE ... WHERE status='STAGED' RETURNING`. Exactly one consumer wins; a duplicate gets no row and acks. The result is written in the same transaction as the `VALIDATING → COMPLETED` transition, so it can only be written once. A test delivers the same message twice and asserts one result and zero extra model calls.
+
+**"What happens if a worker crashes mid-job?"**
+While a job runs, the worker extends the message's visibility every minute. If it dies, the extensions stop and the message reappears within one visibility window, about 3 minutes. The redelivery has a receive count above 1, which is allowed to reclaim a `PROCESSING` job, because the only way that message can come back while the job is still processing is that its owner stopped heartbeating. Without that, a crash would strand the job forever.
+
+**"Why not just let failed messages go to the DLQ?"**
+Then the job row would say `STAGED` forever: the database would be lying. The worker tracks attempts through the receive count and, on the last one, marks the job `FAILED` itself and acks, so the database is always the source of truth. The DLQ only catches messages we can't even parse, and keeps them for inspection.
+
+**"How does live progress work without Redis?"**
+Postgres `LISTEN/NOTIFY`. The worker inserts the event and notifies in the same transaction, so the notification fires only on commit. Each API process has one listening connection that wakes the right streams. Notifications are just wake-ups: the stream always reads the events table after its last event id, so a lost notification can't lose an event, and `Last-Event-ID` resume is the same query. If the listener dies, streams fall back to a 15-second poll.
+
+**"Prove the live path isn't just polling."**
+The integration test sets the heartbeat (the polling interval) to 30 seconds and requires the worker's events to arrive within 10. That only passes if NOTIFY woke the stream.
+
+**"Tell me about a deployment bug."**
+During live verification an async job never progressed. The image build had silently failed, so the old placeholder worker was still running, consuming messages and deleting them. Two takeaways:
+- Verify that a deploy actually rolled out: I checked by importing the new module inside the running container.
+- That failure is precisely the "job stuck in `STAGED` with no message" case. I'd designed a reaper for it, and now I have a concrete reproduction to test it against.
+
+**Numbers to remember:** 180 s visibility, heartbeat every 60 s · backoff 30/60/120 s (cap 15 min) · 3 receives then `FAILED` · 5 Gemini attempts per async job vs 3 sync · 120 s async job deadline · 15 s SSE keep-alive, 10 min stream cap · primary ≤ 50 % of the remaining budget · 200 tests / 94 % coverage.

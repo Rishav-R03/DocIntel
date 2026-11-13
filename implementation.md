@@ -10,6 +10,28 @@
 
 ---
 
+## Revision log
+
+Changes made during implementation. The sections below keep the original plan; where they conflict, this log and the [engineering journal](doc/engineering-journal.md) win.
+
+| Date | Phase | Change | Why |
+|---|---|---|---|
+| 2026-10-23 | 1 | `/health/ready` returns 200 `degraded` (not 503) on dependency failure | A shared-dependency outage must not empty the target group (§4.6) |
+| 2026-10-29 | 2 | Single S3 PUT with `ChecksumSHA256` instead of multipart | ≤ 25 MB objects; end-to-end integrity check |
+| 2026-10-29 | 2 | Error codes `DOCUMENT_UNREADABLE`, `DEPENDENCY_UNAVAILABLE` added | §12.2 |
+| 2026-11-11 | 3 | Model **`gemini-3.8-flash`** (was `gemini-2.5-flash`) | 2.5 Flash closed to new projects, retired on Vertex AI (Oct 2026) |
+| 2026-11-11 | 3 | **Interactions API** + JSON Schema `response_format` (was `generateContent` + `response_schema`) | Google's recommended API for new projects |
+| 2026-11-11 | 3 | `thinking_level` per model (`low` on 3.8 Flash, `minimal` on Flash-Lite); no `temperature` | `thinking_budget` removed; sampling params deprecated (future 400) |
+| 2026-11-11 | 3 | Prices $0.75/$3.75 per 1M tokens, **$1.50/$7.50 from 2027-01-01** (was $0.30/$2.50) | Current pricing; effective-dated table in code |
+| 2026-11-11 | 3 | `store=False` on every request; SDK-level retries disabled | Privacy; the SDK's hidden 5×/30 s retries stacked under ours |
+| 2026-11-12 | 3 | Fallback model `gemini-3.5-flash-lite` after 2 primary attempts | Provider overload observed for two days |
+| 2026-11-13 | 3 | `missing_fields` separated from `low_confidence_fields`; `tables` in `generic_document.v1` | Absent ≠ uncertain; tables lost row grouping as key-values |
+| 2026-11-13 | 3 | Demo UI at `/ui` (local/dev only) | Demonstrability; product remains headless |
+| 2026-11-13 | 4 | Transient async failures requeue with visibility backoff; job marked `FAILED` on the last receive (DLQ only for unparseable messages) | Job state must never diverge from the queue |
+| 2026-11-13 | 4 | Non-final model gets ≤ 50 % of the remaining deadline; provider `retry in …` beyond the deadline → immediate failover / 503 | Hung primary consumed the whole budget |
+| 2026-11-13 | 4 | SSE implemented without `sse-starlette`; NOTIFY is a wake-up only, events read from the DB | No extra dependency; no lost events |
+
+---
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)

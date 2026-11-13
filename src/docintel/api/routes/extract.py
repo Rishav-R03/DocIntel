@@ -60,6 +60,7 @@ class SubmitResponse(BaseModel):
     job_id: uuid.UUID
     status: JobStatus
     status_url: str
+    stream_url: str  # Server-Sent Events: live stage updates
 
 
 class UsageOut(BaseModel):
@@ -87,7 +88,8 @@ class SyncExtractionResponse(BaseModel):
     model_reported_validity: float  # the model's raw self-assessment, for transparency
     data: dict[str, Any]
     warnings: list[ExtractionWarning]
-    low_confidence_fields: list[str]
+    low_confidence_fields: list[str]  # found, but below the confidence threshold
+    missing_fields: list[str]  # not present in the document (value null)
     usage: UsageOut
     timings_ms: TimingsOut
 
@@ -105,6 +107,7 @@ class SyncExtractionResponse(BaseModel):
             data=outcome.data,
             warnings=outcome.warnings,
             low_confidence_fields=list(outcome.validity.low_confidence_fields),
+            missing_fields=list(outcome.validity.missing_fields),
             usage=UsageOut(
                 input_tokens=outcome.input_tokens,
                 output_tokens=outcome.output_tokens,
@@ -175,4 +178,9 @@ async def extract(
             upload_ms=upload_ms,
             total_ms=int((time.perf_counter() - started) * 1000),
         )
-    return SubmitResponse(job_id=job.id, status=job.status, status_url=status_url)
+    return SubmitResponse(
+        job_id=job.id,
+        status=job.status,
+        status_url=status_url,
+        stream_url=request.app.url_path_for("stream_job", job_id=str(job.id)),
+    )

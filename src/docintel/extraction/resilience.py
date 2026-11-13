@@ -52,6 +52,13 @@ async def with_retries[T](
             on_failure(attempt, exc)
             if not exc.retryable or attempt >= policy.max_attempts:
                 raise
+            if exc.retry_after_s is not None and (
+                time.monotonic() + exc.retry_after_s + policy.min_attempt_budget_s > deadline
+            ):
+                # The provider told us when it will accept this model again (e.g. a daily quota
+                # resetting in hours) and that's past our deadline: retrying here is pure waste.
+                # Re-raise the retryable error so the caller fails over or returns 503.
+                raise
             delay = backoff_delay(policy, attempt, exc.retry_after_s)
             if time.monotonic() + delay + policy.min_attempt_budget_s > deadline:
                 raise DeadlineExceededError("retry would exceed the deadline") from exc

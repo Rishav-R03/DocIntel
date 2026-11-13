@@ -25,7 +25,8 @@ CRITICAL_CONFIDENCE_TARGET = 0.9
 class ValidityScore:
     adjusted: float
     model_reported: float
-    low_confidence_fields: tuple[str, ...]
+    low_confidence_fields: tuple[str, ...]  # found, but the model isn't sure
+    missing_fields: tuple[str, ...] = ()  # not in the document (value null): a different signal
 
 
 def score(
@@ -35,17 +36,26 @@ def score(
     critical_confidences: Iterable[float],
     field_confidences: dict[str, float],
     low_confidence_threshold: float,
+    missing_fields: Iterable[str] = (),
 ) -> ValidityScore:
+    """A missing *critical* field still lowers the score through its confidence (the model reports
+    ~0 for absent values); it just isn't reported as "low confidence"."""
+    missing = set(missing_fields)
     critical = list(critical_confidences)
     critical_factor = (
         min(1.0, (sum(critical) / len(critical)) / CRITICAL_CONFIDENCE_TARGET) if critical else 1.0
     )
     adjusted = model_validity * prod(v.penalty for v in violations) * critical_factor
     low = tuple(
-        sorted(name for name, conf in field_confidences.items() if conf < low_confidence_threshold)
+        sorted(
+            name
+            for name, conf in field_confidences.items()
+            if conf < low_confidence_threshold and name not in missing
+        )
     )
     return ValidityScore(
         adjusted=round(max(0.0, min(1.0, adjusted)), 3),
         model_reported=round(model_validity, 3),
         low_confidence_fields=low,
+        missing_fields=tuple(sorted(missing)),
     )

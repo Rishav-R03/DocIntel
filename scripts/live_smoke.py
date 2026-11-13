@@ -17,7 +17,7 @@ import time
 
 from PIL import Image, ImageDraw, ImageFont
 
-from docintel.api.resources import build_pipeline
+from docintel.extraction.factory import build_pipeline
 from docintel.extraction.gemini_client import create_genai_client
 from docintel.extraction.pipeline import Attempt
 from docintel.logging import configure_logging

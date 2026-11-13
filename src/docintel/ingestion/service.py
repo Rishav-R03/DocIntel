@@ -30,7 +30,6 @@ import time
 import uuid
 from collections.abc import Coroutine
 from datetime import UTC, datetime
-from decimal import Decimal
 from typing import Any
 
 import aiohttp
@@ -53,7 +52,8 @@ from docintel.ingestion.staging import DocumentStore, source_key
 from docintel.ingestion.upload import UploadedDocument
 from docintel.messaging import JobQueue
 from docintel.persistence.errors import database_errors_as_unavailable
-from docintel.persistence.models import ExtractionResult, Job, LlmCallAudit
+from docintel.persistence.models import Job
+from docintel.persistence.records import audit_row, jsonable, result_row
 from docintel.persistence.repositories import (
     AuditRepository,
     EventRepository,
@@ -217,7 +217,7 @@ class IngestionService:
                     if outcome is not None:
                         events.add(job.id, EventStage.VALIDATED, at=finished_at)
                         events.add(job.id, EventStage.COMPLETED, at=finished_at)
-                        ResultRepository(session).add(_result_row(job, outcome))
+                        ResultRepository(session).add(result_row(job, outcome))
                     else:
                         events.add(
                             job.id,
@@ -225,7 +225,7 @@ class IngestionService:
                             at=finished_at,
                             payload={"error_code": job.error_code},
                         )
-                    AuditRepository(session).add_all([_audit_row(job.id, a) for a in attempts])
+                    AuditRepository(session).add_all([audit_row(job.id, a) for a in attempts])
         except DependencyUnavailableError:
             # Graceful degradation: the client already has its answer. Keep the audit trail in
             # the log stream (no document content, only metadata/tokens/cost) for replay.
@@ -239,7 +239,7 @@ class IngestionService:
                     "error_code": job.error_code,
                     "duration_ms": job.duration_ms,
                 },
-                attempts=[_jsonable(dataclasses.asdict(a)) for a in attempts],
+                attempts=[jsonable(dataclasses.asdict(a)) for a in attempts],
                 exc_info=True,
             )
             return
@@ -399,39 +399,3 @@ class IngestionService:
             await self._store.delete(key)
         except Exception:
             log.warning("staged_object_cleanup_failed", key=key, exc_info=True)
-
-
-def _result_row(job: Job, outcome: ExtractionOutcome) -> ExtractionResult:
-    return ExtractionResult(
-        job_id=job.id,
-        schema_id=job.schema_id,
-        result=outcome.data,
-        document_validity_score=Decimal(str(outcome.validity.adjusted)),
-        model_reported_validity=Decimal(str(outcome.validity.model_reported)),
-        warnings=[w.model_dump() for w in outcome.warnings],
-    )
-
-
-def _audit_row(job_id: uuid.UUID, a: Attempt) -> LlmCallAudit:
-    return LlmCallAudit(
-        job_id=job_id,
-        attempt=a.attempt,
-        model=a.model,
-        prompt_version=a.prompt_version,
-        input_mode=a.input_mode,
-        prompt_tokens=a.input_tokens,
-        output_tokens=a.output_tokens,
-        thinking_tokens=a.thought_tokens,
-        total_tokens=a.total_tokens,
-        estimated_cost_usd=a.cost_usd,
-        latency_ms=a.latency_ms,
-        outcome=a.outcome,
-        http_status=a.http_status,
-        error_type=a.error_type,
-        finish_reason=a.finish_status,
-        created_at=a.at,
-    )
-
-
-def _jsonable(record: dict[str, Any]) -> dict[str, Any]:
-    return {k: str(v) if isinstance(v, Decimal | datetime) else v for k, v in record.items()}

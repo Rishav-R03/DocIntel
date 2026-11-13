@@ -63,7 +63,8 @@ def test_sync_extraction_returns_result_and_persists_audit_trail(
     assert body["data"]["total_amount"]["value"] == "1200.00"
     assert [w["code"] for w in body["warnings"]] == ["TOTAL_MISMATCH"]
     assert body["document_validity_score"] < body["model_reported_validity"] == 0.96
-    assert body["low_confidence_fields"] == ["vendor_tax_id"]
+    assert body["low_confidence_fields"] == []
+    assert body["missing_fields"] == ["vendor_tax_id"]
     assert body["usage"] == {
         "input_tokens": 2000,
         "output_tokens": 800,

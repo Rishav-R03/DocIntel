@@ -107,6 +107,14 @@ def _field_confidences(domain: BaseModel) -> dict[str, float]:
     }
 
 
+def _missing_fields(domain: BaseModel) -> list[str]:
+    return [
+        name
+        for name in type(domain).model_fields
+        if isinstance(value := getattr(domain, name), Extracted) and value.value is None
+    ]
+
+
 class ExtractionPipeline:
     def __init__(
         self,
@@ -116,10 +124,12 @@ class ExtractionPipeline:
         low_confidence_threshold: float,
         fallback_model: str | None = None,
         fallback_policy: RetryPolicy | None = None,
+        primary_budget_share: float = 0.5,
     ) -> None:
         self._gemini = gemini
         self._retry_policy = retry_policy  # primary model
         self._fallback_policy = fallback_policy or retry_policy
+        self._primary_budget_share = primary_budget_share
         self._low_confidence_threshold = low_confidence_threshold
         self._models = [gemini.model]
         if fallback_model and fallback_model != gemini.model:
@@ -177,6 +187,7 @@ class ExtractionPipeline:
             critical_confidences=[confidences[f] for f in spec.critical_fields],
             field_confidences=confidences,
             low_confidence_threshold=self._low_confidence_threshold,
+            missing_fields=_missing_fields(domain),
         )
         return ExtractionOutcome(
             schema_id=spec.schema_id,
@@ -283,6 +294,10 @@ class ExtractionPipeline:
     ) -> Callable[[int], Awaitable[GeminiResponse]]:
         async def attempt(_: int) -> GeminiResponse:
             remaining = max(1.0, deadline - time.monotonic())
+            if model != self._models[-1]:
+                # Not the last resort: leave part of the budget for failover, so one hung
+                # attempt can't consume the whole deadline (observed: 60 s waits, then no time).
+                remaining = max(1.0, remaining * self._primary_budget_share)
             return await self._gemini.generate(
                 document=document,
                 mime_type=mime_type,

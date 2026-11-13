@@ -185,6 +185,7 @@ def test_generic_document_caps_key_values_in_domain_with_warning() -> None:
             "document_type": cv("memo"),
             "document_date": cv(None, 0.1, None),
             "parties": [],
+            "tables": [],
             "key_values": [kv] * 60,
             "summary": cv("s"),
             "document_validity_score": 0.9,
@@ -193,3 +194,32 @@ def test_generic_document_caps_key_values_in_domain_with_warning() -> None:
     domain, warnings = gd.to_domain(wire)
     assert len(domain.key_values) == gd.MAX_KEY_VALUES
     assert [(w.code, w.field) for w in warnings] == [("TRUNCATED", "key_values")]
+
+
+def test_generic_document_tables_keep_structure_and_flag_ragged_rows() -> None:
+    from docintel.schemas import generic_document as gd
+
+    table = {
+        "title": "Daily  schedule",
+        "columns": ["Time Block", "Deliverable"],
+        "rows": [["05:30 \u2013 06:30 AM", "Physical conditioning"], ["06:45 AM"]],
+        "confidence": 0.9,
+        "page": 2,
+    }
+    wire = gd.GenericDocumentWire.model_validate(
+        {
+            "title": cv("Plan"),
+            "document_type": cv("study guide"),
+            "document_date": cv(None, 0.0, None),
+            "parties": [],
+            "tables": [table],
+            "key_values": [],
+            "summary": cv("s"),
+            "document_validity_score": 0.9,
+        }
+    )
+    domain, warnings = gd.to_domain(wire)
+    [t] = domain.tables
+    assert t.title == "Daily schedule"
+    assert t.rows[0] == ["05:30 \u2013 06:30 AM", "Physical conditioning"]  # row grouping preserved
+    assert [(w.code, w.field) for w in warnings] == [("TABLE_SHAPE_MISMATCH", "tables[0]")]

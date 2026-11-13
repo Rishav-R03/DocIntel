@@ -3,10 +3,12 @@ transaction boundary, so several writes can be atomic."""
 
 import uuid
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docintel.domain.job import EventStage, JobStatus, check_transition
@@ -65,6 +67,44 @@ class AuditRepository:
 
     def add_all(self, rows: Sequence[LlmCallAudit]) -> None:
         self._session.add_all(rows)
+
+    async def usage(self, job_id: uuid.UUID) -> "UsageSummary":
+        """Totals across *all* attempts (failed and repaired ones are billed too)."""
+        row = (
+            await self._session.execute(
+                select(
+                    func.coalesce(func.sum(LlmCallAudit.prompt_tokens), 0),
+                    func.coalesce(func.sum(LlmCallAudit.output_tokens), 0),
+                    func.coalesce(func.sum(LlmCallAudit.thinking_tokens), 0),
+                    func.coalesce(func.sum(LlmCallAudit.estimated_cost_usd), 0),
+                    func.coalesce(func.sum(LlmCallAudit.latency_ms), 0),
+                ).where(LlmCallAudit.job_id == job_id)
+            )
+        ).one()
+        last_success = await self._session.scalar(
+            select(LlmCallAudit.model)
+            .where(LlmCallAudit.job_id == job_id, LlmCallAudit.outcome == "SUCCESS")
+            .order_by(LlmCallAudit.id.desc())
+            .limit(1)
+        )
+        return UsageSummary(
+            input_tokens=int(row[0] or 0),
+            output_tokens=int(row[1] or 0),
+            thinking_tokens=int(row[2] or 0),
+            cost_usd=Decimal(row[3] or 0),
+            model_ms=int(row[4] or 0),
+            model=last_success,
+        )
+
+
+@dataclass(frozen=True)
+class UsageSummary:
+    input_tokens: int
+    output_tokens: int
+    thinking_tokens: int
+    cost_usd: Decimal
+    model_ms: int
+    model: str | None
 
 
 class EventRepository:

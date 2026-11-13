@@ -47,6 +47,20 @@ class S3BucketCheck:
         await self._s3.head_bucket(Bucket=self._bucket)
 
 
+class EventListenerCheck:
+    """Live progress (SSE) relies on the API's LISTEN connection. When it's down, streams still
+    work but fall back to heartbeat polling, so this reports degraded, never "not ready"."""
+
+    name = "events"
+
+    def __init__(self, broker: Any) -> None:
+        self._broker = broker
+
+    async def __call__(self) -> None:
+        if not self._broker.connected:
+            raise ConnectionError("event listener not connected")
+
+
 async def _run_one(check: HealthCheck, timeout_s: float) -> CheckResult:
     start = time.perf_counter()
     try:

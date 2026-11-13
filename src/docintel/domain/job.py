@@ -27,13 +27,17 @@ class EventStage(StrEnum):
     VALIDATED = "VALIDATED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    RETRY_SCHEDULED = "RETRY_SCHEDULED"  # async: transient failure, job back in the queue
 
 
 ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     JobStatus.RECEIVED: frozenset({JobStatus.STAGED, JobStatus.FAILED}),
     JobStatus.STAGED: frozenset({JobStatus.PROCESSING, JobStatus.FAILED}),
-    # PROCESSING -> STAGED: retryable failure, message goes back to the queue
-    JobStatus.PROCESSING: frozenset({JobStatus.VALIDATING, JobStatus.STAGED, JobStatus.FAILED}),
+    # PROCESSING -> STAGED: retryable failure, message goes back to the queue.
+    # PROCESSING -> PROCESSING: a redelivered message reclaims a job whose worker died mid-run.
+    JobStatus.PROCESSING: frozenset(
+        {JobStatus.VALIDATING, JobStatus.STAGED, JobStatus.PROCESSING, JobStatus.FAILED}
+    ),
     JobStatus.VALIDATING: frozenset({JobStatus.COMPLETED, JobStatus.FAILED}),
     JobStatus.COMPLETED: frozenset(),
     JobStatus.FAILED: frozenset(),

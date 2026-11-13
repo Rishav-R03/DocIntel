@@ -1,4 +1,4 @@
-"""Message handler contract. The real extraction handler replaces ``LoggingHandler`` in Phase 4."""
+"""Message handler contract (the extraction handler lives in ``extraction_handler.py``)."""
 
 from collections.abc import Mapping
 from typing import Any, Protocol
@@ -6,6 +6,14 @@ from typing import Any, Protocol
 import structlog
 
 log = structlog.get_logger(__name__)
+
+
+class RetryLaterError(Exception):
+    """Raised by a handler to have the message redelivered after `delay_s` (not deleted)."""
+
+    def __init__(self, reason: str, *, delay_s: int) -> None:
+        super().__init__(reason)
+        self.delay_s = delay_s
 
 
 class MessageHandler(Protocol):

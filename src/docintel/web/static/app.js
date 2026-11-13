@@ -255,7 +255,30 @@ function fieldsTable(data, lowConfidence) {
   ]);
 }
 
+const isTable = (item) => item && Array.isArray(item.columns) && Array.isArray(item.rows);
+
+function tablesSection(name, tables) {
+  return h("div", {}, [
+    h("h6", { class: "mt-4", text: `${humanize(name)} (${tables.length})` }),
+    ...tables.map((t, i) =>
+      h("div", { class: "mb-3" }, [
+        h("div", { class: "d-flex justify-content-between small mb-1" }, [
+          h("span", { class: "fw-semibold", text: t.title || `Table ${i + 1}` }),
+          h("span", { class: "text-secondary", text: `page ${t.page ?? "–"} · confidence ${pct(t.confidence)}` }),
+        ]),
+        h("div", { class: "table-responsive" }, [
+          h("table", { class: "table table-sm table-bordered align-middle" }, [
+            h("thead", { class: "table-light" }, [h("tr", {}, t.columns.map((c) => h("th", { scope: "col", text: c })))]),
+            h("tbody", {}, t.rows.map((row) => h("tr", {}, row.map((cell) => h("td", { text: cell }))))),
+          ]),
+        ]),
+      ]),
+    ),
+  ]);
+}
+
 function listSection(name, items) {
+  if (items.length && items.every(isTable)) return tablesSection(name, items);
   const title = h("h6", { class: "mt-4", text: `${humanize(name)} (${items.length})` });
   if (!items.length) return h("div", {}, [title, h("p", { class: "small text-secondary", text: "None found." })]);
   // A list of bare extracted values (e.g. generic_document.parties) or of objects of them.
@@ -353,6 +376,9 @@ function renderResult(body, elapsedMs) {
     lowConfidence.size
       ? h("p", { class: "small text-secondary", text: `Highlighted rows are below the confidence threshold: ${[...lowConfidence].join(", ")}.` })
       : null,
+    (body.missing_fields || []).length
+      ? h("p", { class: "small text-secondary", text: `Not present in the document: ${body.missing_fields.join(", ")}.` })
+      : null,
     h("div", { class: "table-responsive" }, [fieldsTable(body.data, lowConfidence)]),
     ...lists.map(([name, items]) => listSection(name, items)),
     rawJson(body),
@@ -360,43 +386,108 @@ function renderResult(body, elapsedMs) {
 }
 
 // ----------------------------------------------------------------------------- rendering: async job
+const STAGE_LABELS = {
+  UPLOADED: "Uploaded and validated",
+  S3_STAGED: "Stored (encrypted)",
+  GEMINI_PROCESSING: "Extracting with Gemini",
+  RETRY_SCHEDULED: "AI provider busy, retrying",
+  VALIDATED: "Validated against the schema",
+  COMPLETED: "Completed",
+  FAILED: "Failed",
+};
+let stream = null;
+
 function renderJob(submit, clientId) {
-  const status = h("span", { class: "badge text-bg-info", text: submit.status });
-  const log = h("ul", { class: "small text-secondary mb-0" }, [h("li", { text: `${new Date().toLocaleTimeString()} · ${submit.status}` })]);
+  if (stream) stream.close();
+  const status = h("span", { class: "badge text-bg-info", text: "QUEUED" });
+  const timeline = h("ol", { class: "list-group list-group-numbered mb-3" });
   $("result").replaceChildren(
     h("div", { class: "d-flex justify-content-between align-items-center mb-3" }, [
-      h("h5", { class: "mb-0", text: "Job queued" }),
+      h("h5", { class: "mb-0", text: "Job submitted" }),
       status,
     ]),
     h("dl", { class: "row small mb-3" }, [
       h("dt", { class: "col-sm-3", text: "Job id" }),
       h("dd", { class: "col-sm-9 font-monospace", text: submit.job_id }),
-      h("dt", { class: "col-sm-3", text: "Status URL" }),
-      h("dd", { class: "col-sm-9 font-monospace", text: submit.status_url }),
+      h("dt", { class: "col-sm-3", text: "Live updates" }),
+      h("dd", { class: "col-sm-9 font-monospace", text: submit.stream_url }),
     ]),
-    h("div", {
-      class: "alert alert-info small",
-      text: "The document is validated, stored encrypted and queued. The worker that processes async jobs " +
-        "arrives in Phase 4, so the status stays STAGED for now. Use Sync mode to see an extraction.",
-    }),
-    h("h6", { text: "Status history" }),
-    log,
-    rawJson(submit),
+    h("h6", { text: "Progress (live, Server-Sent Events)" }),
+    timeline,
   );
 
+  const addStep = (data, variant) => {
+    const time = new Date(data.ts).toLocaleTimeString();
+    let label = STAGE_LABELS[data.stage] || data.stage;
+    if (data.stage === "RETRY_SCHEDULED") label += ` in ${data.retry_in_s}s (${data.error_code})`;
+    if (data.stage === "FAILED" && data.error_code) label += ` (${data.error_code})`;
+    timeline.append(
+      h("li", { class: `list-group-item d-flex justify-content-between ${variant || ""}` }, [
+        h("span", { text: label }),
+        h("span", { class: "small text-secondary", text: time }),
+      ]),
+    );
+    status.textContent = data.stage;
+  };
+
+  // EventSource can't send headers; X-Client-Id-scoped jobs are only viewable via polling.
+  if (clientId) {
+    timeline.append(h("li", { class: "list-group-item small text-secondary", text: "Live updates need no X-Client-Id; polling status instead." }));
+    return pollJob(submit, clientId, status);
+  }
+  stream = new EventSource(submit.stream_url);
+  stream.addEventListener("stage", (e) => {
+    const data = JSON.parse(e.data);
+    addStep(data, data.stage === "RETRY_SCHEDULED" ? "list-group-item-warning" : "");
+  });
+  stream.addEventListener("completed", async (e) => {
+    addStep(JSON.parse(e.data), "list-group-item-success");
+    stream.close();
+    await showJobResult(submit.status_url, clientId);
+  });
+  stream.addEventListener("failed", async (e) => {
+    addStep(JSON.parse(e.data), "list-group-item-danger");
+    stream.close();
+    const job = await (await fetch(submit.status_url)).json();
+    $("result").append(rawJson(job));
+  });
+}
+
+async function showJobResult(statusUrl, clientId) {
+  const res = await fetch(statusUrl, { headers: clientId ? { "X-Client-Id": clientId } : {} });
+  const job = await res.json();
+  if (!res.ok || !job.result) return renderProblem(job, res.status, null);
+  const r = job.result;
+  // Same view as sync mode: adapt the stored result to the sync response shape.
+  renderResult(
+    {
+      job_id: job.job_id,
+      schema_id: job.schema_id,
+      status: job.status,
+      model: r.model || "",
+      document_validity_score: r.document_validity_score,
+      model_reported_validity: r.model_reported_validity ?? r.document_validity_score,
+      data: r.data,
+      warnings: r.warnings,
+      low_confidence_fields: [],
+      missing_fields: [],
+      usage: r.usage,
+      timings_ms: { gemini_ms: r.model_ms },
+    },
+    job.duration_ms || 0,
+  );
+}
+
+function pollJob(submit, clientId, status) {
   let polls = 0;
-  let last = submit.status;
   const poll = async () => {
     polls += 1;
     try {
-      const res = await fetch(submit.status_url, { headers: clientId ? { "X-Client-Id": clientId } : {} });
+      const res = await fetch(submit.status_url, { headers: { "X-Client-Id": clientId } });
       const job = await res.json();
-      if (res.ok && job.status !== last) {
-        last = job.status;
-        status.textContent = job.status;
-        log.append(h("li", { text: `${new Date().toLocaleTimeString()} · ${job.status}` }));
-      }
-      if (res.ok && TERMINAL.has(job.status)) return;
+      if (res.ok) status.textContent = job.status;
+      if (res.ok && job.status === "COMPLETED") return showJobResult(submit.status_url, clientId);
+      if (res.ok && TERMINAL.has(job.status)) return $("result").append(rawJson(job));
     } catch {
       /* transient; keep polling */
     }
@@ -404,7 +495,6 @@ function renderJob(submit, clientId) {
   };
   pollTimer = setTimeout(poll, POLL_MS);
 }
-
 // ----------------------------------------------------------------------------- boot
 $("file").addEventListener("change", onFileChosen);
 $("schema").addEventListener("change", updateSubmitState);

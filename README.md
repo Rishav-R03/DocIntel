@@ -12,11 +12,12 @@ Headless microservice that turns PDFs and images (invoices, financial statements
 |---|---|
 | 1. Foundation | ✅ Complete |
 | 2. Ingestion | ✅ Complete |
-| 3. Extraction engine + sync API | 🟡 Built and tested; live Gemini verification pending |
+| 3. Extraction engine + sync API | ✅ Complete (verified live on Gemini; primary-model latency pending provider capacity) |
+| 4. Async worker + live progress (SSE) | ✅ Complete (verified live) |
 
 Today you can upload a document and either:
 - get the extracted JSON back immediately (`mode=sync`, which calls Gemini), or
-- queue it as a job (`mode=async`). The worker that processes async jobs arrives in Phase 4.
+- queue it as a job (`mode=async`): the worker processes it in the background and you can watch each stage live (`GET /api/v1/jobs/{id}/stream`, Server-Sent Events).
 
 ---
 
@@ -118,7 +119,8 @@ The response contains:
 
 ```bash
 curl.exe -X POST "http://localhost:8000/api/v1/extract" -F "file=@invoice.pdf" -F "schema_id=invoice.v1"
-curl.exe http://localhost:8000/api/v1/jobs/<job_id>
+curl.exe http://localhost:8000/api/v1/jobs/<job_id>              # status, plus the result once COMPLETED
+curl.exe -N http://localhost:8000/api/v1/jobs/<job_id>/stream    # live stages (Server-Sent Events)
 ```
 
 Optional request headers:

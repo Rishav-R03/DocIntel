@@ -67,10 +67,12 @@ services:
   worker:
     build: { context: ., target: runtime, args: { GIT_SHA: local } }
     environment: *app-env
+    env_file: [{ path: .env, required: false }]  # Gemini key: the worker runs async extractions
     command: ["python", "-m", "docintel.worker"]
     read_only: true
     tmpfs: [/tmp]
     depends_on:
+      migrate: { condition: service_completed_successfully }
       bootstrap: { condition: service_completed_successfully }
 
   test:

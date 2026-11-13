@@ -15,9 +15,10 @@ class FakeSQS:
     def __init__(self, batches: list[list[dict[str, Any]]]) -> None:
         self._batches = batches
         self.deleted: list[str] = []
+        self.visibility: list[tuple[str, int]] = []
         self.receive_calls = 0
 
-    async def receive_message(self, *, MaxNumberOfMessages: int, **_: Any) -> dict[str, Any]:  # noqa: N803
+    async def receive_message(self, *, MaxNumberOfMessages: int, **_: Any) -> dict[str, Any]:
         self.receive_calls += 1
         if self._batches:
             batch = self._batches.pop(0)
@@ -27,8 +28,17 @@ class FakeSQS:
         await asyncio.sleep(3600)
         return {}
 
-    async def delete_message(self, *, QueueUrl: str, ReceiptHandle: str) -> None:  # noqa: N803
+    async def delete_message(self, *, QueueUrl: str, ReceiptHandle: str) -> None:
         self.deleted.append(ReceiptHandle)
+
+    async def change_message_visibility(
+        self,
+        *,
+        QueueUrl: str,
+        ReceiptHandle: str,
+        VisibilityTimeout: int,
+    ) -> None:
+        self.visibility.append((ReceiptHandle, VisibilityTimeout))
 
 
 class RecordingHandler:
@@ -142,3 +152,42 @@ async def test_receive_errors_back_off_and_still_stop(error: Exception) -> None:
     await _until(lambda: sqs.receive_calls >= 1)
     worker.request_stop()
     await asyncio.wait_for(run, timeout=1)  # backoff sleep is interruptible
+
+
+async def test_retry_later_reschedules_instead_of_deleting() -> None:
+    from docintel.worker.handler import RetryLaterError
+
+    class Busy:
+        async def handle(self, message: Mapping[str, Any]) -> None:
+            raise RetryLaterError("UPSTREAM_UNAVAILABLE", delay_s=60)
+
+    sqs = FakeSQS([[_msg(1)]])
+    worker = _worker(sqs, Busy())
+    run = asyncio.create_task(worker.run())
+    await _until(lambda: sqs.visibility == [("r1", 60)])
+    worker.request_stop()
+    await asyncio.wait_for(run, timeout=1)
+    assert sqs.deleted == []  # comes back after the backoff, not after the full timeout
+
+
+async def test_heartbeat_extends_visibility_while_a_job_runs() -> None:
+    class Slow:
+        async def handle(self, message: Mapping[str, Any]) -> None:
+            await asyncio.sleep(2.5)
+
+    sqs = FakeSQS([[_msg(1)]])
+    worker = Worker(
+        sqs=sqs, queue_url=QUEUE, handler=Slow(), concurrency=1, visibility_timeout_s=3
+    )  # heartbeat every 1 s
+    run = asyncio.create_task(worker.run())
+    await _until(lambda: sqs.deleted == ["r1"], within_s=5)
+    worker.request_stop()
+    await asyncio.wait_for(run, timeout=1)
+    assert len(sqs.visibility) >= 2
+    assert all(v == ("r1", 3) for v in sqs.visibility)
+
+
+def test_async_retry_backoff() -> None:
+    from docintel.worker.extraction_handler import retry_delay_s
+
+    assert [retry_delay_s(n) for n in (1, 2, 3, 4, 10)] == [30, 60, 120, 240, 900]
